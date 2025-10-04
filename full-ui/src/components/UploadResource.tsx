@@ -1,14 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useUser } from '../contexts/UserContext';
-import { useData } from '../contexts/DataContext';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Textarea } from './ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
-import { ArrowLeft, Upload, FileText, Video, Link, File, CheckCircle, Tag, X } from 'lucide-react';
-import { resourcesAPI } from '../services/api';
+import { ArrowLeft, Upload, CheckCircle, Tag, X } from 'lucide-react';
+import { resourcesAPI, coursesAPI } from '../services/api';
 
 interface UploadResourceProps {
   onBack: () => void;
@@ -16,14 +15,15 @@ interface UploadResourceProps {
 
 export const UploadResource: React.FC<UploadResourceProps> = ({ onBack }) => {
   const { user } = useUser();
-  const { classes, courses } = useData();
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
+  const [courses, setCourses] = useState<Array<{ id: string; code?: string; name?: string }>>([]);
   
   const [formData, setFormData] = useState({
     title: "",
     description: "",
-    resource_type: "document" as "document" | "video" | "link" | "image" | "other",
+    resource_type: "document" as "document" | "video" | "link" | "image" | "slides" | "other",
+    category: "materials" as "syllabus" | "announcements" | "materials",
     course_id: "",
     file_url: "", // S3 bucket URL
     file_name: "",
@@ -36,6 +36,18 @@ export const UploadResource: React.FC<UploadResourceProps> = ({ onBack }) => {
 
   const [newTag, setNewTag] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  // Load courses for selection
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await coursesAPI.getAllCourses();
+        if (!res.error && res.data?.courses) {
+          setCourses(res.data.courses as any);
+        }
+      } catch {}
+    })();
+  }, []);
 
   const handleInputChange = (field: string, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }));
@@ -73,6 +85,12 @@ export const UploadResource: React.FC<UploadResourceProps> = ({ onBack }) => {
 
   const validateForm = () => {
     const newErrors: Record<string, string> = {};
+    if (!formData.category) {
+      newErrors.category = "Category is required";
+    }
+    if (!formData.resource_type) {
+      newErrors.resource_type = "Resource type is required";
+    }
 
     if (!formData.title.trim()) {
       newErrors.title = "Title is required";
@@ -117,8 +135,8 @@ export const UploadResource: React.FC<UploadResourceProps> = ({ onBack }) => {
       };
 
       const response = await resourcesAPI.createResource(resourceData);
-      
-      if (response.success) {
+
+      if (!response.error) {
         setSuccess(true);
         
         // Auto-navigate back after success
@@ -208,19 +226,58 @@ export const UploadResource: React.FC<UploadResourceProps> = ({ onBack }) => {
               <Label htmlFor="course" className="text-sm font-medium text-gray-700 mb-2">
                 Course *
               </Label>
-              <Select value={formData.course_id} onValueChange={(value) => handleInputChange("course_id", value)}>
+              <Select value={formData.course_id} onValueChange={(value: string) => handleInputChange("course_id", value)}>
                 <SelectTrigger className={`w-full ${errors.course_id ? 'border-red-300' : ''}`}>
                   <SelectValue placeholder="Select a course" />
                 </SelectTrigger>
                 <SelectContent>
-                  {courses?.map(course => (
+                  {courses?.map((course: any) => (
                     <SelectItem key={course.id} value={course.id}>
-                      {course.code} - {course.name}
+                      {(course.code || 'COURSE')} - {(course.name || 'Untitled')}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
               {errors.course_id && <p className="text-sm text-red-600 mt-1">{errors.course_id}</p>}
+            </div>
+
+            {/* Category Selection */}
+            <div>
+              <Label htmlFor="category" className="text-sm font-medium text-gray-700 mb-2">
+                Category *
+              </Label>
+              <Select value={formData.category} onValueChange={(value: 'syllabus' | 'announcements' | 'materials') => handleInputChange('category', value)}>
+                <SelectTrigger className={`w-full ${errors.category ? 'border-red-300' : ''}`}>
+                  <SelectValue placeholder="Select a category" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="syllabus">Syllabus</SelectItem>
+                  <SelectItem value="announcements">Announcements</SelectItem>
+                  <SelectItem value="materials">Class Materials</SelectItem>
+                </SelectContent>
+              </Select>
+              {errors.category && <p className="text-sm text-red-600 mt-1">{errors.category}</p>}
+            </div>
+
+            {/* Resource Type Selection */}
+            <div>
+              <Label htmlFor="resource_type" className="text-sm font-medium text-gray-700 mb-2">
+                Resource Type *
+              </Label>
+              <Select value={formData.resource_type} onValueChange={(value: 'document' | 'video' | 'link' | 'image' | 'slides' | 'other') => handleInputChange('resource_type', value)}>
+                <SelectTrigger className={`w-full ${errors.resource_type ? 'border-red-300' : ''}`}>
+                  <SelectValue placeholder="Select a type" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="document">Document</SelectItem>
+                  <SelectItem value="slides">Slides</SelectItem>
+                  <SelectItem value="video">Video</SelectItem>
+                  <SelectItem value="image">Image</SelectItem>
+                  <SelectItem value="link">Link</SelectItem>
+                  <SelectItem value="other">Other</SelectItem>
+                </SelectContent>
+              </Select>
+              {errors.resource_type && <p className="text-sm text-red-600 mt-1">{errors.resource_type}</p>}
             </div>
 
             {/* External Resource Toggle */}

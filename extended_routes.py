@@ -3,6 +3,7 @@ Extended API Endpoints - Part 2
 Additional endpoints for complete coverage
 """
 from fastapi import APIRouter, HTTPException
+from datetime import datetime
 
 def add_extended_routes(app, supabase):
     """Add all the extended routes to the FastAPI app"""
@@ -22,14 +23,19 @@ def add_extended_routes(app, supabase):
     @app.get("/api/users/{user_id}/stats")
     def get_user_detailed_stats(user_id: str):
         try:
-            # Get user's enrollments, assignments, etc.
-            enrollments = supabase.table("enrollments").select("*").eq("student_id", user_id).execute()
-            submissions = supabase.table("assignment_submissions").select("*").eq("student_id", user_id).execute()
-            
-            return {
-                "enrollments_count": len(enrollments.data) if enrollments.data else 0,
-                "submissions_count": len(submissions.data) if submissions.data else 0
-            }
+            # Get user's enrollments, submissions (optional tables may not exist)
+            try:
+                enrollments = supabase.table("enrollments").select("*").eq("student_id", user_id).execute()
+                enrollments_count = len(enrollments.data) if enrollments.data else 0
+            except Exception:
+                enrollments_count = 0
+            try:
+                submissions = supabase.table("assignment_submissions").select("*").eq("student_id", user_id).execute()
+                submissions_count = len(submissions.data) if submissions.data else 0
+            except Exception:
+                submissions_count = 0
+
+            return {"enrollments_count": enrollments_count, "submissions_count": submissions_count}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
@@ -43,11 +49,8 @@ def add_extended_routes(app, supabase):
     
     @app.get("/api/sessions/{session_id}/attendance")
     def get_session_attendance(session_id: str):
-        try:
-            result = supabase.table("current_sessions").select("attendance_data, attendance_count").eq("id", session_id).execute()
-            return {"attendance": result.data[0] if result.data else None}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        # current_sessions table is not used anymore; return empty attendance info
+        return {"attendance": None}
     
     # ============================================================================
     # ADDITIONAL CLASSES ENDPOINTS
@@ -56,7 +59,8 @@ def add_extended_routes(app, supabase):
     @app.get("/api/classes/course/{course_id}")
     def get_classes_by_course(course_id: str):
         try:
-            result = supabase.table("classes").select("*").eq("course_id", course_id).execute()
+            # Use the 'timetable' table (renamed from 'class')
+            result = supabase.table("timetable").select("*").eq("course_id", course_id).execute()
             return {"classes": result.data}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -106,13 +110,42 @@ def add_extended_routes(app, supabase):
     # ============================================================================
     
     @app.get("/api/resources/filter")
-    def filter_resources(type: str = ""):
+    def filter_resources(type: str = "", category: str = "", courseId: str = ""):
         try:
+            query = supabase.table("resources").select("*")
             if type:
-                result = supabase.table("resources").select("*").eq("resource_type", type).execute()
-            else:
-                result = supabase.table("resources").select("*").limit(20).execute()
-            return {"resources": result.data}
+                query = query.eq("resource_type", type)
+            if category:
+                query = query.eq("category", category)
+            if courseId:
+                query = query.eq("course_id", courseId)
+            if not type and not category:
+                query = query.limit(20)
+            result = query.execute()
+            rows = result.data or []
+            # Best-effort enrichment
+            try:
+                user_ids = list({r.get("uploaded_by") for r in rows if r.get("uploaded_by")})
+                course_ids = list({r.get("course_id") for r in rows if r.get("course_id")})
+                user_map, course_map = {}, {}
+                if user_ids:
+                    ures = supabase.table("users").select("id, first_name, last_name").in_("id", user_ids).execute()
+                    for u in (ures.data or []):
+                        user_map[u["id"]] = {"first_name": u.get("first_name"), "last_name": u.get("last_name")}
+                if course_ids:
+                    cres = supabase.table("courses").select("id, name, code").in_("id", course_ids).execute()
+                    for c in (cres.data or []):
+                        course_map[c["id"]] = {"name": c.get("name"), "code": c.get("code")}
+                for r in rows:
+                    uid = r.get("uploaded_by")
+                    cid = r.get("course_id")
+                    if uid and uid in user_map:
+                        r["uploader"] = user_map[uid]
+                    if cid and cid in course_map:
+                        r["courses"] = course_map[cid]
+            except Exception:
+                pass
+            return {"resources": rows}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
@@ -120,7 +153,26 @@ def add_extended_routes(app, supabase):
     def get_resources_by_course(course_id: str):
         try:
             result = supabase.table("resources").select("*").eq("course_id", course_id).execute()
-            return {"resources": result.data}
+            rows = result.data or []
+            try:
+                user_ids = list({r.get("uploaded_by") for r in rows if r.get("uploaded_by")})
+                user_map = {}
+                if user_ids:
+                    ures = supabase.table("users").select("id, first_name, last_name").in_("id", user_ids).execute()
+                    for u in (ures.data or []):
+                        user_map[u["id"]] = {"first_name": u.get("first_name"), "last_name": u.get("last_name")}
+                # course is known (course_id), get name/code once
+                c = supabase.table("courses").select("name, code").eq("id", course_id).limit(1).execute()
+                cinfo = {"name": c.data[0].get("name"), "code": c.data[0].get("code")} if c.data else None
+                for r in rows:
+                    uid = r.get("uploaded_by")
+                    if uid and uid in user_map:
+                        r["uploader"] = user_map[uid]
+                    if cinfo:
+                        r["courses"] = cinfo
+            except Exception:
+                pass
+            return {"resources": rows}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
@@ -133,11 +185,15 @@ def add_extended_routes(app, supabase):
             }).eq("id", resource_id).execute()
             
             # Log download in resource_downloads table
-            supabase.table("resource_downloads").insert({
-                "resource_id": resource_id,
-                "user_id": data.get("user_id"),
-                "downloaded_at": "now()"
-            }).execute()
+            try:
+                supabase.table("resource_downloads").insert({
+                    "resource_id": resource_id,
+                    "user_id": data.get("user_id"),
+                    "downloaded_at": datetime.utcnow().isoformat() + "Z",
+                }).execute()
+            except Exception:
+                # Optional table might not exist; ignore logging failure
+                pass
             
             return {"message": f"Download tracked for resource {resource_id}"}
         except Exception as e:
@@ -152,15 +208,11 @@ def add_extended_routes(app, supabase):
                 "description": data.get("description"),
                 "resource_type": data.get("resource_type", "document"),
                 "file_url": data.get("file_url"),  # S3 bucket URL
-                "file_name": data.get("file_name"),
-                "file_size": data.get("file_size"),
-                "file_type": data.get("file_type"),
                 "course_id": data.get("course_id"),
                 "uploaded_by": data.get("uploaded_by"),
-                "is_external": data.get("is_external", False),
-                "external_url": data.get("external_url"),
                 "tags": data.get("tags", []),
-                "download_count": 0
+                "download_count": 0,
+                "category": data.get("category", "materials"),
             }
             
             result = supabase.table("resources").insert(resource_data).execute()
@@ -181,18 +233,10 @@ def add_extended_routes(app, supabase):
                 update_data["resource_type"] = data["resource_type"]
             if "file_url" in data:
                 update_data["file_url"] = data["file_url"]
-            if "file_name" in data:
-                update_data["file_name"] = data["file_name"]
-            if "file_size" in data:
-                update_data["file_size"] = data["file_size"]
-            if "file_type" in data:
-                update_data["file_type"] = data["file_type"]
             if "tags" in data:
                 update_data["tags"] = data["tags"]
-            if "is_external" in data:
-                update_data["is_external"] = data["is_external"]
-            if "external_url" in data:
-                update_data["external_url"] = data["external_url"]
+            if "category" in data:
+                update_data["category"] = data["category"]
             
             result = supabase.table("resources").update(update_data).eq("id", resource_id).execute()
             return {"message": f"Resource {resource_id} updated successfully", "resource": result.data[0]}
@@ -205,7 +249,8 @@ def add_extended_routes(app, supabase):
             result = supabase.table("resources").delete().eq("id", resource_id).execute()
             return {"message": f"Resource {resource_id} deleted successfully"}
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))    # ============================================================================
+            raise HTTPException(status_code=500, detail=str(e))
+    # ============================================================================
     # ADDITIONAL FILE ENDPOINTS
     # ============================================================================
     
@@ -217,16 +262,17 @@ def add_extended_routes(app, supabase):
             else:
                 result = supabase.table("files").select("*").limit(20).execute()
             return {"files": result.data}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            # Optional table not present
+            return {"files": []}
     
     @app.get("/api/files/course/{course_id}")
     def get_files_by_course(course_id: str):
         try:
             result = supabase.table("files").select("*").eq("course_id", course_id).execute()
             return {"files": result.data}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            return {"files": []}
     
     @app.post("/api/files/upload")
     def upload_file(data: dict):
@@ -253,10 +299,10 @@ def add_extended_routes(app, supabase):
     # ============================================================================
     
     @app.get("/api/projects/filter")
-    def filter_projects(status: str = ""):
+    def filter_projects(project_type: str = ""):
         try:
-            if status:
-                result = supabase.table("projects").select("*").eq("status", status).execute()
+            if project_type:
+                result = supabase.table("projects").select("*").eq("project_type", project_type).execute()
             else:
                 result = supabase.table("projects").select("*").limit(20).execute()
             return {"projects": result.data}
@@ -265,27 +311,393 @@ def add_extended_routes(app, supabase):
     
     @app.post("/api/projects")
     def create_project(data: dict):
-        return {"message": "Project created", "data": data}
+        try:
+            # Validate required fields
+            title = (data.get("title") or "").strip()
+            if not title:
+                raise HTTPException(status_code=400, detail="title is required")
+
+            creator_id = data.get("creator_id")
+            if not creator_id:
+                raise HTTPException(status_code=400, detail="creator_id is required")
+
+            # Resolve creator_name from users table (best-effort)
+            creator_name = "Unknown"
+            try:
+                creator = supabase.table("users").select("first_name, last_name").eq("id", creator_id).limit(1).execute()
+                if creator.data:
+                    creator_name = f"{creator.data[0].get('first_name', '')} {creator.data[0].get('last_name', '')}".strip() or "Unknown"
+            except Exception:
+                pass
+
+            # Normalize and validate members_needed/current_members per DDL checks
+            members_needed = data.get("members_needed", data.get("team_size", 4))
+            try:
+                members_needed = int(members_needed)
+            except Exception:
+                members_needed = 4
+            if members_needed <= 0:
+                raise HTTPException(status_code=400, detail="members_needed must be > 0")
+            current_members = 1  # creator is first member
+
+            # Project type: restrict to allowed values
+            allowed_types = {"academic", "hackathon", "research"}
+            project_type = str(data.get("project_type") or "academic").strip().lower()[:50]
+            if project_type not in allowed_types:
+                raise HTTPException(status_code=400, detail=f"Invalid project_type '{project_type}'. Allowed: {sorted(list(allowed_types))}")
+
+            # If academic, course_id is required and must exist
+            course_id = data.get("course_id")
+            if project_type == "academic":
+                if not course_id:
+                    raise HTTPException(status_code=400, detail="course_id is required for academic projects")
+                try:
+                    c = supabase.table("courses").select("id").eq("id", course_id).limit(1).execute()
+                    if not c.data:
+                        raise HTTPException(status_code=400, detail="Invalid course_id")
+                except HTTPException:
+                    raise
+                except Exception:
+                    # If validation call fails, proceed but include provided course_id
+                    pass
+
+            # Normalize skills needed to text[]
+            skills_raw = data.get("skills_needed", [])
+            if isinstance(skills_raw, str):
+                # Support comma-separated
+                skills_needed = [s.strip() for s in skills_raw.split(',') if s.strip()]
+            elif isinstance(skills_raw, list):
+                skills_needed = [str(s).strip() for s in skills_raw if str(s).strip()]
+            else:
+                skills_needed = []
+
+            # due_date is timestamp without time zone; accept 'YYYY-MM-DD' or full timestamp
+            due_date = data.get("due_date")
+            if due_date:
+                try:
+                    from datetime import datetime
+                    s = str(due_date).strip()
+                    # Convert 'YYYY-MM-DD' to 'YYYY-MM-DD 00:00:00'
+                    if len(s) == 10 and s.count('-') == 2:
+                        s = s + " 00:00:00"
+                    # Try parsing common formats; store as ISO string
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                        try:
+                            due_dt = datetime.strptime(s, fmt)
+                            due_date = due_dt.strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            else:
+                due_date = None
+
+            # Build project payload per DDL (omit created_at/updated_at to let DB defaults/triggers apply)
+            project_data = {
+                "title": title[:200],
+                "description": data.get("description"),
+                "course_id": course_id if course_id else None,
+                "creator_id": creator_id,
+                "creator_name": creator_name[:100],
+                "due_date": due_date,
+                "members_needed": members_needed,
+                "current_members": current_members,
+                "member_ids": [creator_id],
+                "member_names": [creator_name],
+                "project_type": project_type,
+                "skills_needed": skills_needed,
+                "is_open_for_members": True,
+            }
+
+            result = supabase.table("projects").insert(project_data).execute()
+            
+            if result.data:
+                return {"message": "Project created successfully", "project": result.data[0]}
+            else:
+                raise HTTPException(status_code=500, detail="Failed to create project")
+                
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
     
     @app.put("/api/projects/{project_id}")
     def update_project(project_id: str, data: dict):
-        return {"message": f"Project {project_id} updated", "data": data}
+        try:
+            update_data = {}
+            allowed_fields = ["title", "description", "due_date", "members_needed", "project_type", "skills_needed", "course_id", "is_open_for_members"]
+
+            # Normalize fields similarly to create
+            if "title" in data and data["title"] is not None:
+                update_data["title"] = str(data["title"]).strip()[:200]
+            if "description" in data:
+                update_data["description"] = data["description"]
+            if "project_type" in data and data["project_type"] is not None:
+                allowed_types = {"academic", "hackathon", "research"}
+                pt = str(data["project_type"]).strip().lower()[:50]
+                if pt not in allowed_types:
+                    raise HTTPException(status_code=400, detail=f"Invalid project_type '{pt}'. Allowed: {sorted(list(allowed_types))}")
+                update_data["project_type"] = pt
+            if "members_needed" in data and data["members_needed"] is not None:
+                try:
+                    mn = int(data["members_needed"])
+                except Exception:
+                    mn = None
+                if mn is not None:
+                    if mn <= 0:
+                        raise HTTPException(status_code=400, detail="members_needed must be > 0")
+                    update_data["members_needed"] = mn
+            if "skills_needed" in data:
+                skills_raw = data.get("skills_needed", [])
+                if isinstance(skills_raw, str):
+                    update_data["skills_needed"] = [s.strip() for s in skills_raw.split(',') if s.strip()]
+                elif isinstance(skills_raw, list):
+                    update_data["skills_needed"] = [str(s).strip() for s in skills_raw if str(s).strip()]
+                else:
+                    update_data["skills_needed"] = []
+            if "due_date" in data:
+                due_date = data.get("due_date")
+                if due_date:
+                    try:
+                        from datetime import datetime
+                        s = str(due_date).strip()
+                        if len(s) == 10 and s.count('-') == 2:
+                            s = s + " 00:00:00"
+                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                            try:
+                                due_dt = datetime.strptime(s, fmt)
+                                update_data["due_date"] = due_dt.strftime("%Y-%m-%d %H:%M:%S")
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        update_data["due_date"] = None
+                else:
+                    update_data["due_date"] = None
+            if "course_id" in data:
+                update_data["course_id"] = data["course_id"] or None
+            if "is_open_for_members" in data:
+                update_data["is_open_for_members"] = bool(data["is_open_for_members"])
+
+            # Execute update
+            result = supabase.table("projects").update(update_data).eq("id", project_id).execute()
+            return {"message": f"Project {project_id} updated successfully", "project": result.data[0]}
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/project-types")
+    def list_project_types():
+        """Return available project types.
+        Tries 'project_types' table (value/label), else distinct project_type from 'projects', else defaults.
+        """
+        try:
+            allowed = {"academic", "hackathon", "research"}
+            defaults = ["academic", "hackathon", "research"]
+            # Try a dedicated table first
+            try:
+                table_res = supabase.table("project_types").select("value, label").execute()
+                if table_res.data:
+                    types = []
+                    for row in table_res.data:
+                        v = (row.get("value") or "").strip().lower() or None
+                        if v and v in allowed:
+                            types.append({"value": v, "label": row.get("label") or v.capitalize()})
+                    if types:
+                        return {"types": types}
+            except Exception:
+                pass
+
+            # Fallback: distinct from projects
+            try:
+                rows = supabase.table("projects").select("project_type").execute()
+                vals = []
+                if rows.data:
+                    seen = set()
+                    for r in rows.data:
+                        v = (r.get("project_type") or "").strip().lower()
+                        if v and v in allowed and v not in seen:
+                            seen.add(v)
+                            vals.append({"value": v, "label": v.capitalize()})
+                if vals:
+                    return {"types": vals}
+            except Exception:
+                pass
+
+            # Default
+            return {"types": [{"value": v, "label": v.capitalize()} for v in defaults]}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
     
     @app.delete("/api/projects/{project_id}")
     def delete_project(project_id: str):
-        return {"message": f"Project {project_id} deleted"}
+        try:
+            # Then delete the project
+            result = supabase.table("projects").delete().eq("id", project_id).execute()
+            return {"message": f"Project {project_id} deleted successfully"}
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/api/projects/{project_id}/join")
+    def join_project(project_id: str, data: dict):
+        try:
+            user_id = data.get("user_id")
+            if not user_id:
+                raise HTTPException(status_code=400, detail="user_id is required")
+            
+            # Get project info
+            project = supabase.table("projects").select("*").eq("id", project_id).execute()
+            if not project.data:
+                raise HTTPException(status_code=404, detail="Project not found")
+            
+            project_info = project.data[0]
+            
+            # Check if project is open for new members
+            if not project_info.get("is_open_for_members", True):
+                raise HTTPException(status_code=400, detail="Project is not accepting new members")
+            
+            # Check if project has space
+            current_members = project_info.get("current_members", 1)
+            members_needed = project_info.get("members_needed", 1)
+            
+            if current_members >= members_needed:
+                raise HTTPException(status_code=400, detail="Project team is full")
+            
+            # Check if user is already a member
+            member_ids = project_info.get("member_ids", [])
+            if user_id in member_ids:
+                raise HTTPException(status_code=400, detail="User is already a member of this project")
+            
+            # Get user info
+            user = supabase.table("users").select("first_name, last_name").eq("id", user_id).execute()
+            user_name = "Unknown"
+            if user.data:
+                user_name = f"{user.data[0].get('first_name', '')} {user.data[0].get('last_name', '')}".strip()
+            
+            # Add user to project arrays
+            new_member_ids = member_ids + [user_id]
+            new_member_names = project_info.get("member_names", []) + [user_name]
+            new_current_members = current_members + 1
+            
+            # Close project if it reaches capacity
+            is_open = new_current_members < members_needed
+            
+            # Update project with new member
+            update_data = {
+                "member_ids": new_member_ids,
+                "member_names": new_member_names,
+                "current_members": new_current_members,
+                "is_open_for_members": is_open,
+            }
+            
+            result = supabase.table("projects").update(update_data).eq("id", project_id).execute()
+            
+            if result.data:
+                return {
+                    "message": "Successfully joined project", 
+                    "project": result.data[0],
+                    "spots_remaining": members_needed - new_current_members
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to join project")
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
     
     @app.post("/api/projects/{project_id}/members")
     def add_project_member(project_id: str, data: dict):
-        return {"message": f"Member added to project {project_id}", "data": data}
+        # This is now handled by join_project endpoint
+        return join_project(project_id, data)
     
     @app.delete("/api/projects/{project_id}/members/{user_id}")
     def remove_project_member(project_id: str, user_id: str):
-        return {"message": f"Member {user_id} removed from project {project_id}"}
+        try:
+            # Get project info
+            project = supabase.table("projects").select("*").eq("id", project_id).execute()
+            if not project.data:
+                raise HTTPException(status_code=404, detail="Project not found")
+            
+            project_info = project.data[0]
+            member_ids = project_info.get("member_ids", [])
+            member_names = project_info.get("member_names", [])
+            
+            # Check if user is a member
+            if user_id not in member_ids:
+                raise HTTPException(status_code=404, detail="User is not a member of this project")
+            
+            # Check if trying to remove creator
+            if user_id == project_info.get("creator_id"):
+                raise HTTPException(status_code=400, detail="Cannot remove project creator")
+            
+            # Remove user from arrays
+            user_index = member_ids.index(user_id)
+            new_member_ids = [mid for mid in member_ids if mid != user_id]
+            new_member_names = [member_names[i] for i, mid in enumerate(member_ids) if mid != user_id]
+            new_current_members = len(new_member_ids)
+            
+            # Update project
+            update_data = {
+                "member_ids": new_member_ids,
+                "member_names": new_member_names,
+                "current_members": new_current_members,
+                "is_open_for_members": True,  # Re-open for members
+            }
+            
+            result = supabase.table("projects").update(update_data).eq("id", project_id).execute()
+            
+            if result.data:
+                return {"message": f"Member removed from project successfully"}
+            else:
+                raise HTTPException(status_code=500, detail="Failed to remove member")
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
     
-    @app.put("/api/projects/{project_id}/progress")
-    def update_project_progress(project_id: str, data: dict):
-        return {"message": f"Project {project_id} progress updated", "data": data}
+    # Progress endpoint removed due to simplified schema
+    
+    @app.get("/api/projects/{project_id}/members")
+    def get_project_members(project_id: str):
+        try:
+            # Get project with member info
+            project = supabase.table("projects").select("member_ids, member_names, creator_id").eq("id", project_id).execute()
+            
+            if not project.data:
+                raise HTTPException(status_code=404, detail="Project not found")
+            
+            project_info = project.data[0]
+            member_ids = project_info.get("member_ids", [])
+            member_names = project_info.get("member_names", [])
+            creator_id = project_info.get("creator_id")
+            
+            # Build member list with roles
+            members = []
+            for i, member_id in enumerate(member_ids):
+                member_name = member_names[i] if i < len(member_names) else "Unknown"
+                role = "owner" if member_id == creator_id else "member"
+                
+                members.append({
+                    "id": f"{project_id}_{member_id}",  # Unique ID for compatibility
+                    "project_id": project_id,
+                    "user_id": member_id,
+                    "role": role,
+                    "joined_at": None,  # Not tracked in simplified schema
+                    "users": {
+                        "id": member_id,
+                        "full_name": member_name,
+                        "email": None,  # Would need separate query
+                        "student_id": None
+                    }
+                })
+            
+            return members
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
     
     # ============================================================================
     # ADDITIONAL NOTIFICATION ENDPOINTS
@@ -312,8 +724,8 @@ def add_extended_routes(app, supabase):
         try:
             result = supabase.table("user_preferences").select("*").limit(1).execute()
             return {"settings": result.data[0] if result.data else {}}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            return {"settings": {}}
     
     @app.put("/api/notifications/settings")
     def update_notification_settings(data: dict):
@@ -332,8 +744,8 @@ def add_extended_routes(app, supabase):
             else:
                 result = supabase.table("ideas").select("*").limit(20).execute()
             return {"ideas": result.data}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            return {"ideas": []}
     
     @app.post("/api/ideas")
     def create_idea(data: dict):
@@ -360,8 +772,8 @@ def add_extended_routes(app, supabase):
                 if row.get("tags"):
                     all_tags.extend(row["tags"])
             return {"tags": list(set(all_tags))}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            return {"tags": []}
     
     # ============================================================================
     # ADDITIONAL AI CHAT ENDPOINTS
@@ -466,7 +878,7 @@ def add_extended_routes(app, supabase):
     @app.get("/api/departments/{department_id}/faculty")
     def get_department_faculty(department_id: str):
         try:
-            result = supabase.table("users").select("*").eq("department_id", department_id).execute()
+            result = supabase.table("users").select("*").eq("dept", department_id).execute()
             return {"faculty": result.data}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -478,12 +890,19 @@ def add_extended_routes(app, supabase):
     @app.get("/api/stats/academic")
     def get_academic_stats():
         try:
-            enrollments = supabase.table("enrollments").select("*").execute()
-            active_courses = supabase.table("courses").select("*").eq("is_active", True).execute()
-            
+            try:
+                enrollments = supabase.table("enrollments").select("*").execute()
+                total_enrollments = len(enrollments.data) if enrollments.data else 0
+            except Exception:
+                total_enrollments = 0
+
+            # courses schema has no is_active; count all courses
+            courses_res = supabase.table("courses").select("*").execute()
+            active_courses_count = len(courses_res.data) if courses_res.data else 0
+
             return {
-                "total_enrollments": len(enrollments.data) if enrollments.data else 0,
-                "active_courses": len(active_courses.data) if active_courses.data else 0
+                "total_enrollments": total_enrollments,
+                "active_courses": active_courses_count
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -492,11 +911,15 @@ def add_extended_routes(app, supabase):
     def get_resource_usage_stats():
         try:
             resources = supabase.table("resources").select("*").execute()
-            downloads = supabase.table("resource_downloads").select("*").execute()
-            
+            try:
+                downloads = supabase.table("resource_downloads").select("*").execute()
+                total_downloads = len(downloads.data) if downloads.data else 0
+            except Exception:
+                total_downloads = 0
+
             return {
                 "total_resources": len(resources.data) if resources.data else 0,
-                "total_downloads": len(downloads.data) if downloads.data else 0
+                "total_downloads": total_downloads
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -524,8 +947,9 @@ def add_extended_routes(app, supabase):
         try:
             result = supabase.table("user_activity").select("*").order("created_at", desc=True).limit(100).execute()
             return {"timeline": result.data}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        except Exception:
+            # Optional table might not exist
+            return {"timeline": []}
     
     # ============================================================================
     # SYSTEM ENDPOINTS

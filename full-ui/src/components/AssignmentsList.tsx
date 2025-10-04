@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { ArrowLeft } from "lucide-react";
 import { assignmentsAPI, Assignment } from "../services/api";
 import { AssignmentCard } from "./AssignmentCard";
 
@@ -10,29 +11,17 @@ export function AssignmentsList({ onBack }: AssignmentsListProps) {
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'all' | 'upcoming' | 'overdue'>('all');
 
   useEffect(() => {
     loadAssignments();
-  }, [filter]);
+  }, []);
 
   const loadAssignments = async () => {
     setLoading(true);
     setError(null);
     
     try {
-      let response;
-      
-      switch (filter) {
-        case 'upcoming':
-          response = await assignmentsAPI.getUpcomingAssignments();
-          break;
-        case 'overdue':
-          response = await assignmentsAPI.getOverdueAssignments();
-          break;
-        default:
-          response = await assignmentsAPI.getAllAssignments();
-      }
+      const response = await assignmentsAPI.getAllAssignments();
 
       if (response.error) {
         setError(response.error);
@@ -82,29 +71,21 @@ export function AssignmentsList({ onBack }: AssignmentsListProps) {
 
   return (
     <div className="p-6 space-y-6">
-      <div className="flex justify-between items-center">
-        <div>
-          <h1 className="text-2xl font-bold text-white">Assignments</h1>
-          <p className="text-gray-400">
-            {assignments.length} assignment{assignments.length !== 1 ? 's' : ''} found
-          </p>
-        </div>
-        
-        {/* Filter buttons */}
-        <div className="flex gap-2">
-          {(['all', 'upcoming', 'overdue'] as const).map((filterOption) => (
-            <button
-              key={filterOption}
-              onClick={() => setFilter(filterOption)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                filter === filterOption
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-              }`}
-            >
-              {filterOption.charAt(0).toUpperCase() + filterOption.slice(1)}
-            </button>
-          ))}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => (onBack ? onBack() : window.history.back())}
+            className="p-2 hover:bg-gray-800 rounded-lg transition-colors"
+            aria-label="Back"
+          >
+            <ArrowLeft size={20} className="text-white" />
+          </button>
+          <div>
+            <h1 className="text-2xl font-bold text-white">Assignments</h1>
+            <p className="text-gray-400">
+              {assignments.length} assignment{assignments.length !== 1 ? 's' : ''} found
+            </p>
+          </div>
         </div>
       </div>
 
@@ -136,23 +117,7 @@ export function AssignmentsList({ onBack }: AssignmentsListProps) {
         </div>
       )}
 
-      {/* Debug information (can be removed in production) */}
-      {process.env.NODE_ENV === 'development' && (
-        <div className="mt-8 p-4 bg-gray-800 rounded-lg">
-          <h3 className="text-white font-semibold mb-2">Debug Info</h3>
-          <div className="text-gray-400 text-sm">
-            <div>Total assignments: {assignments.length}</div>
-            <div>Current filter: {filter}</div>
-            <div>
-              Status distribution: {JSON.stringify(
-                Object.fromEntries(
-                  Object.entries(groupedAssignments).map(([status, items]) => [status, items.length])
-                )
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Debug info removed */}
     </div>
   );
 }

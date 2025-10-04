@@ -19,10 +19,15 @@ export interface User {
   first_name: string;
   last_name: string;
   role: 'student' | 'faculty' | 'admin';
+  // New schema fields
+  roll_no?: string;
+  dept?: string; // department code
+  class?: string | null; // class UUID
+  cgpa?: number | null;
   avatar_url?: string;
   phone?: string;
-  department_id?: string;
-  year_of_study?: string;
+  department_id?: string; // legacy
+  year_of_study?: string; // legacy
   bio?: string;
   gpa?: number;
   total_credits?: number;
@@ -119,9 +124,15 @@ async function apiRequest<T>(
     const response = await fetch(url, defaultOptions);
     
     if (!response.ok) {
+      let errMsg = `API Error: ${response.status} ${response.statusText}`;
+      try {
+        const errBody = await response.json();
+        const detail = (errBody && (errBody.detail || errBody.message || errBody.error)) as string | undefined;
+        if (detail) errMsg = detail;
+      } catch {}
       console.error(`API Error: ${response.status} ${response.statusText}`);
       return {
-        error: `API Error: ${response.status} ${response.statusText}`,
+        error: errMsg,
         status: response.status,
       };
     }
@@ -179,6 +190,12 @@ export const authAPI = {
     first_name: string;
     last_name: string;
     role: string;
+    // New schema
+    roll_no: string;
+    dept: string; // department code
+    class?: string; // UUID
+    cgpa?: number;
+    // Legacy optional
     student_id?: string;
     department_id?: string;
     year_of_study?: string;
@@ -195,6 +212,9 @@ export const authAPI = {
       const user = response.data.user;
       user.name = `${user.first_name} ${user.last_name}`;
       user.avatar = user.avatar_url;
+      // Compatibility mappings
+      if (!user.student_id && user.roll_no) user.student_id = user.roll_no;
+      if (!user.gpa && user.cgpa != null) user.gpa = user.cgpa as any;
     }
 
     return response;
@@ -223,7 +243,7 @@ function transformClass(apiClass: any): Class {
     // Backward compatibility fields
     name: apiClass.courses?.name || apiClass.title || 'Unknown Course',
     code: apiClass.courses?.code || 'N/A',
-    instructor: apiClass.instructor || 'TBA', // Will be populated when instructor data is available
+  instructor: apiClass.instructor || '', // Empty when instructor not available
     day_of_week: typeof apiClass.day_of_week === 'number' ? dayNames[apiClass.day_of_week] : apiClass.day_of_week,
   };
 }
@@ -304,6 +324,74 @@ export const classesAPI = {
     
     return response as ApiResponse<{ class: Class | null }>;
   },
+
+  async getClassesByDate(date: string, section?: string): Promise<ApiResponse<{ classes: Class[] }>> {
+    // Use path-param endpoint to avoid conflict with /api/classes/{class_id}
+    const qs = new URLSearchParams();
+    if (section) qs.set('section', section);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const response = await apiRequest<{ classes: any[] }>(`/api/classes/date/${encodeURIComponent(date)}${suffix}`);
+    if (response.data?.classes) {
+      response.data.classes = transformClasses(response.data.classes);
+    }
+    return response as ApiResponse<{ classes: Class[] }>;
+  },
+
+  // Faculty: Create a class (timetable entry)
+  async createClass(payload: {
+    course_id: string;
+    room: string;
+    section: string;
+    start_time: string; // "HH:MM" or full ISO
+    end_time: string;   // "HH:MM" or full ISO
+    day_of_week: string; // monday..saturday
+  }): Promise<ApiResponse<{ message: string; class: Class }>> {
+    return apiRequest('/api/classes', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  // Faculty: Update a class
+  async updateClass(classId: string, payload: Partial<{
+    course_id: string;
+    room: string;
+    section: string;
+    start_time: string;
+    end_time: string;
+    day_of_week: string;
+  }>): Promise<ApiResponse<{ message: string; class: Class }>> {
+    return apiRequest(`/api/classes/${classId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  // Faculty: Delete a class
+  async deleteClass(classId: string): Promise<ApiResponse<{ message: string }>> {
+    return apiRequest(`/api/classes/${classId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  // Saturday mapping maintenance
+  async createSaturdayMapping(payload: { date: string; section: string; tt_followed: string }): Promise<ApiResponse<{ message: string; saturday_class: any }>> {
+    return apiRequest('/api/saturday-class', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  async updateSaturdayMapping(rowId: string, payload: Partial<{ date: string; section: string; tt_followed: string }>): Promise<ApiResponse<{ message: string; saturday_class: any }>> {
+    return apiRequest(`/api/saturday-class/${rowId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+  async deleteSaturdayMapping(rowId: string): Promise<ApiResponse<{ message: string }>> {
+    return apiRequest(`/api/saturday-class/${rowId}`, {
+      method: 'DELETE',
+    });
+  },
 };
 
 // Helper function to transform assignment data for backward compatibility
@@ -322,8 +410,8 @@ function transformAssignment(apiAssignment: any): Assignment {
   return {
     ...apiAssignment,
     // Computed fields for convenience
-    course_name: apiAssignment.courses?.name || 'Unknown Course',
-    course_code: apiAssignment.courses?.code || 'N/A',
+    course_name: apiAssignment.courses?.name || '',
+    course_code: apiAssignment.courses?.code || '',
     days_until_due: daysDiff,
     status: status,
   };
@@ -563,7 +651,17 @@ export const usersAPI = {
   },
 
   async searchUsers(query?: string): Promise<ApiResponse<{ users: User[] }>> {
-    const endpoint = query ? `/api/users/search?query=${encodeURIComponent(query)}` : '/api/users/search';
+    const params = new URLSearchParams();
+    if (query) params.set('q', query);
+    // Optionally attach current user id if you have it in localStorage
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const { id } = JSON.parse(storedUser);
+        if (id) params.set('current_user_id', id);
+      }
+    } catch {}
+    const endpoint = `/api/search/users${params.toString() ? `?${params.toString()}` : ''}`;
     return apiRequest(endpoint);
   },
 };
@@ -584,7 +682,8 @@ export interface Resource {
   id: string;
   title: string;
   description: string;
-  resource_type: 'document' | 'video' | 'link' | 'image' | 'other';
+  resource_type: 'document' | 'video' | 'link' | 'image' | 'slides' | 'other';
+  category?: 'syllabus' | 'announcements' | 'materials';
   url?: string;
   file_url?: string; // S3 bucket URL
   file_name?: string;
@@ -614,12 +713,20 @@ export interface Project {
   course_id?: string;
   created_by?: string;
   due_date?: string;
-  status?: 'not-started' | 'in-progress' | 'completed';
   created_at?: string;
   courses?: {
     name: string;
     code: string;
   };
+  members_needed?: number;
+  current_members?: number;
+  project_type?: string;
+  skills_needed?: string[];
+}
+
+export interface ProjectTypeOption {
+  value: string;
+  label: string;
 }
 
 export interface FileItem {
@@ -659,6 +766,31 @@ export interface Idea {
   };
 }
 
+// Events interfaces
+export interface CalendarEvent {
+  id?: string;
+  title: string;
+  description?: string;
+  event_type: string; // 'event' | 'assignment' | 'exam' | 'class' | 'meeting' | 'personal' | ...
+  start_date: string; // YYYY-MM-DD
+  end_date?: string; // YYYY-MM-DD
+  start_time?: string; // HH:MM:SS
+  end_time?: string; // HH:MM:SS
+  is_all_day?: boolean;
+  is_recurring?: boolean;
+  recurrence_type?: string;
+  recurrence_end_date?: string;
+  priority?: string;
+  status?: string;
+  color?: string; // '#RRGGBB'
+  course_id?: string;
+  assignment_id?: string;
+  class_id?: string;
+  created_by?: string; // user id
+  location?: string;
+  is_personal?: boolean;
+}
+
 // Resources API calls
 export const resourcesAPI = {
   async getAllResources(): Promise<ApiResponse<{ resources: Resource[] }>> {
@@ -682,6 +814,7 @@ export const resourcesAPI = {
     title: string;
     description: string;
     resource_type: string;
+    category?: 'syllabus' | 'announcements' | 'materials';
     file_url?: string;
     file_name?: string;
     file_size?: number;
@@ -717,11 +850,18 @@ export const resourcesAPI = {
     });
   },
 
-  async getResourcesByType(type: string): Promise<ApiResponse<{ resources: Resource[] }>> {
-    return apiRequest(`/api/resources/filter?type=${encodeURIComponent(type)}`);
+  async getResourcesByType(type: string, category?: 'syllabus' | 'announcements' | 'materials'): Promise<ApiResponse<{ resources: Resource[] }>> {
+    const params = new URLSearchParams({ type });
+    if (category) params.set('category', category);
+    return apiRequest(`/api/resources/filter?${params.toString()}`);
   },
 
-  async getResourcesByCourse(courseId: string): Promise<ApiResponse<{ resources: Resource[] }>> {
+  async getResourcesByCourse(courseId: string, category?: 'syllabus' | 'announcements' | 'materials'): Promise<ApiResponse<{ resources: Resource[] }>> {
+    if (category) {
+      // Leverage filter endpoint when category is specified
+      const params = new URLSearchParams({ category, courseId });
+      return apiRequest(`/api/resources/filter?${params.toString()}`);
+    }
     return apiRequest(`/api/resources/course/${courseId}`);
   },
 };
@@ -738,6 +878,10 @@ export const projectsAPI = {
 
   async getProjectMembers(projectId: string): Promise<ApiResponse<{ members: any[] }>> {
     return apiRequest(`/api/projects/${projectId}/members`);
+  },
+
+  async getProjectTypes(): Promise<ApiResponse<{ types: ProjectTypeOption[] }>> {
+    return apiRequest('/api/project-types');
   },
 };
 
@@ -1015,6 +1159,86 @@ export const searchUtils = {
   }
 };
 
+// Calendar & Events API calls
+export const calendarAPI = {
+  async getMonth(year: number, month: number, userId?: string): Promise<ApiResponse<{ events_by_date: Record<string, CalendarEvent[]>; total_events: number }>> {
+    const params = new URLSearchParams();
+    if (userId) params.set('user_id', userId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/calendar/${year}/${month}${suffix}`);
+  },
+
+  async listEvents(month?: number, year?: number, userId?: string): Promise<ApiResponse<{ events: CalendarEvent[] }>> {
+    const params = new URLSearchParams();
+    if (month) params.set('month', String(month));
+    if (year) params.set('year', String(year));
+    if (userId) params.set('user_id', userId);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/events${suffix}`);
+  },
+
+  async createEvent(event: CalendarEvent): Promise<ApiResponse<{ event: CalendarEvent; message: string }>> {
+    // Client-side schema defaults to align with DB
+    event.event_type = (event.event_type || 'event') as any;
+    if (event.priority == null) event.priority = 'medium' as any;
+    if (event.status == null) event.status = 'scheduled' as any;
+    if (!event.color) event.color = '#3b82f6';
+    const normTime = (v?: string) => (v && v.length === 5 && v.includes(':') ? `${v}:00` : v);
+    if (event.start_time) event.start_time = normTime(event.start_time);
+    if (event.end_time) event.end_time = normTime(event.end_time);
+
+    // If current user is a student, force personal events client-side too
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'student') {
+          event.is_personal = true;
+          if (!event.created_by && u.id) event.created_by = u.id;
+        }
+      }
+    } catch {}
+    return apiRequest('/api/events', {
+      method: 'POST',
+      body: JSON.stringify(event),
+    });
+  },
+
+  async updateEvent(eventId: string, event: Partial<CalendarEvent>): Promise<ApiResponse<{ event: CalendarEvent; message: string }>> {
+    // Client-side normalization to match DB
+    if (event.event_type !== undefined) event.event_type = (event.event_type || 'event') as any;
+    if (event.priority !== undefined && !event.priority) event.priority = 'medium' as any;
+    if (event.status !== undefined && !event.status) event.status = 'scheduled' as any;
+    if (event.color !== undefined && !event.color) event.color = '#3b82f6';
+    const normTime = (v?: string) => (v && v.length === 5 && v.includes(':') ? `${v}:00` : v);
+    if (event.start_time !== undefined && event.start_time) event.start_time = normTime(event.start_time);
+    if (event.end_time !== undefined && event.end_time) event.end_time = normTime(event.end_time);
+
+    // If current user is a student, ensure personal-only updates and pass user_id for backend enforcement
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'student') {
+          event.is_personal = true;
+          (event as any).user_id = u.id;
+          if ('created_by' in event) delete (event as any).created_by;
+        }
+      }
+    } catch {}
+    return apiRequest(`/api/events/${eventId}`, {
+      method: 'PUT',
+      body: JSON.stringify(event),
+    });
+  },
+
+  async deleteEvent(eventId: string): Promise<ApiResponse<{ message: string }>> {
+    return apiRequest(`/api/events/${eventId}`, {
+      method: 'DELETE',
+    });
+  },
+};
+
 export default {
   auth: authAPI,
   classes: classesAPI,
@@ -1033,4 +1257,16 @@ export default {
   stats: statsAPI,
   activity: activityAPI,
   searchUtils: searchUtils,
+  calendar: calendarAPI,
+};
+
+// Directory data for signup dropdowns
+export const directoryAPI = {
+  async listDepartments(): Promise<ApiResponse<{ departments: Array<{ id?: string; code?: string; name?: string }> }>> {
+    return apiRequest('/api/departments');
+  },
+  async listClasses(dept?: string): Promise<ApiResponse<{ classes: Array<{ id: string; academic_year: string; section: string; dept: string; class?: string }> }>> {
+    const qs = dept ? `?dept=${encodeURIComponent(dept)}` : '';
+    return apiRequest(`/api/class-list${qs}`);
+  }
 };

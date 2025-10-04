@@ -421,7 +421,7 @@ GET    /api/enrollments/status            # Enrollment status summary
 ```
 GET    /api/resources                     # All resources (Resources component)
 GET    /api/resources/search?q=           # Search resources (Resources search)
-GET    /api/resources/filter?type=        # Filter by type (notes/videos/links)
+GET    /api/resources/filter?type=        # Filter by type (document/video/link/image/slides)
 GET    /api/resources/course/:courseId    # Course resources
 GET    /api/resources/:id                 # Single resource details
 POST   /api/resources/:id/download        # Download resource & track downloads

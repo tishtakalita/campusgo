@@ -1,5 +1,5 @@
 import React from "react";
-import { Book, Calendar, ChevronRight, AlertTriangle, AlertCircle, CheckCircle, Clock, FileText, Trophy } from "lucide-react";
+import { Book, Calendar, AlertTriangle, AlertCircle, CheckCircle, Clock, FileText, Trophy } from "lucide-react";
 import { Assignment } from "../services/api";
 
 interface AssignmentCardProps {
@@ -119,7 +119,7 @@ export function AssignmentCard({ assignment, onClick }: AssignmentCardProps) {
         
         <div className="p-4">
           {/* Header with title, type, and status */}
-          <div className="flex justify-between items-start mb-3 gap-3">
+          <div className="flex items-start mb-3 gap-3">
             <div className="flex-1">
               <div className="flex items-center gap-2 mb-2">
                 <TypeIcon size={14} className="text-gray-400" />
@@ -131,21 +131,16 @@ export function AssignmentCard({ assignment, onClick }: AssignmentCardProps) {
                 </div>
               </div>
               <h3 className="text-white font-semibold text-base leading-snug mb-2">{assignment.title}</h3>
-              <div className="flex items-center gap-2">
-                <div className="w-5 h-5 rounded-full bg-gray-700/50 flex items-center justify-center">
-                  <Book size={11} className="text-gray-500" />
+              {(assignment.course_name || assignment.course_code) && (
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded-full bg-gray-700/50 flex items-center justify-center">
+                    <Book size={11} className="text-gray-500" />
+                  </div>
+                  <span className="text-gray-400 text-sm font-medium">
+                    {[assignment.course_name, assignment.course_code].filter(Boolean).join(' ')}
+                  </span>
                 </div>
-                <span className="text-gray-400 text-sm font-medium">
-                  {assignment.course_name} ({assignment.course_code})
-                </span>
-              </div>
-            </div>
-            
-            <div className={`bg-gradient-to-r ${config.colors} px-2 py-1 rounded-xl flex items-center gap-1`}>
-              <IconComponent size={10} className="text-white" />
-              <span className="text-white text-xs font-semibold uppercase tracking-wide">
-                {assignment.priority}
-              </span>
+              )}
             </div>
           </div>
           
@@ -170,10 +165,6 @@ export function AssignmentCard({ assignment, onClick }: AssignmentCardProps) {
                 <Trophy size={12} className="text-yellow-500" />
                 <span className="text-gray-300 text-sm font-medium">{assignment.total_points} pts</span>
               </div>
-            </div>
-            
-            <div className="w-8 h-8 rounded-full bg-gray-700/50 flex items-center justify-center group-hover:bg-gray-600/50 transition-colors">
-              <ChevronRight size={14} className="text-gray-500" />
             </div>
           </div>
         </div>

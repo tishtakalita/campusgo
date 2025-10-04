@@ -1,19 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useDashboard } from '../contexts/DashboardContext';
-import { useUser } from '../contexts/UserContext';
-import { Assignment, Class } from '../services/api';
 import { AssignmentCard } from './AssignmentCard';
 import { CurrentClass } from './CurrentClass';
-import { Calendar, Clock, Trophy, BookOpen, Users, TrendingUp, AlertCircle } from 'lucide-react';
+import { Calendar, AlertCircle } from 'lucide-react';
+import api from '../services/api';
+import { useUser } from '../contexts/UserContext';
 
 interface DashboardProps {
   onNavigate: (view: string) => void;
 }
 
 export function Dashboard({ onNavigate }: DashboardProps) {
-  const { user } = useUser();
   const { dashboardData, isLoading, error, refreshDashboard } = useDashboard();
-  const [selectedTimeframe, setSelectedTimeframe] = useState<'today' | 'week' | 'month'>('today');
+  const { user } = useUser();
+  const [upcomingCalendarEvents, setUpcomingCalendarEvents] = useState<Array<{ title: string; subtitle?: string }>>([]);
+
 
   // Auto-refresh dashboard data every 5 minutes
   useEffect(() => {
@@ -23,6 +24,52 @@ export function Dashboard({ onNavigate }: DashboardProps) {
 
     return () => clearInterval(interval);
   }, [refreshDashboard]);
+
+  // Build Upcoming Events from calendar API only (including personal events)
+  useEffect(() => {
+    const loadCalendarPreview = async () => {
+      try {
+        const now = new Date();
+        const month = now.getMonth() + 1;
+        const year = now.getFullYear();
+        const userId = user?.id;
+        // Fetch current month and next month to ensure we have at least two items
+        const [resThis, resNext] = await Promise.all([
+          api.calendar.getMonth(year, month, userId),
+          api.calendar.getMonth(month === 12 ? year + 1 : year, month === 12 ? 1 : month + 1, userId)
+        ]);
+        const byDate = {
+          ...(resThis.data?.events_by_date || {}),
+          ...(resNext.data?.events_by_date || {})
+        } as Record<string, any[]>;
+        const todayStr = now.toISOString().split('T')[0];
+
+        // Flatten and sort only today and upcoming dates
+        const items: Array<{ date: string; title: string; subtitle?: string; start?: string }>= [];
+        Object.keys(byDate).forEach(dateStr => {
+          const list = byDate[dateStr] || [];
+          list.forEach(evt => {
+            items.push({
+              date: dateStr,
+              title: evt.title,
+              subtitle: evt.location || undefined,
+              start: evt.start_time
+            });
+          });
+        });
+        const filtered = items
+          .filter(i => i.date >= todayStr)
+          .sort((a, b) => (a.date + (a.start || '')) .localeCompare(b.date + (b.start || '')))
+          .slice(0, 2)
+          .map(i => ({ title: i.title, subtitle: i.subtitle }));
+        setUpcomingCalendarEvents(filtered);
+      } catch (e) {
+        console.warn('Failed to load calendar preview', e);
+        setUpcomingCalendarEvents([]);
+      }
+    };
+    loadCalendarPreview();
+  }, [user?.id]);
 
   if (isLoading) {
     return (
@@ -67,198 +114,85 @@ export function Dashboard({ onNavigate }: DashboardProps) {
   const todayClasses = dashboardData.today_overview?.today_classes || [];
   const dueToday = dashboardData.today_overview?.due_today || [];
 
-  // Filter assignments based on selected timeframe
+  // Get all assignments combined from both sources
   const getFilteredAssignments = () => {
-    const now = new Date();
-    const assignments = dashboardData.recent_assignments || [];
+    // Combine assignments from both sources to show all assignments
+    const recentAssignments = dashboardData.recent_assignments || [];
+    const upcomingDeadlines = dashboardData.upcoming_deadlines || [];
     
-    switch (selectedTimeframe) {
-      case 'today':
-        return assignments.filter(assignment => {
-          const dueDate = new Date(assignment.due_date);
-          return dueDate.toDateString() === now.toDateString();
-        });
-      case 'week':
-        const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-        return assignments.filter(assignment => {
-          const dueDate = new Date(assignment.due_date);
-          return dueDate >= now && dueDate <= weekFromNow;
-        });
-      case 'month':
-        const monthFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-        return assignments.filter(assignment => {
-          const dueDate = new Date(assignment.due_date);
-          return dueDate >= now && dueDate <= monthFromNow;
-        });
-      default:
-        return assignments;
-    }
+    // Merge and deduplicate assignments by ID
+    const allAssignments = [...recentAssignments];
+    upcomingDeadlines.forEach(deadline => {
+      if (!allAssignments.some(assignment => assignment.id === deadline.id)) {
+        allAssignments.push(deadline);
+      }
+    });
+    
+    // Sort by due date (earliest first)
+    return allAssignments.sort((a, b) => 
+      new Date(a.due_date).getTime() - new Date(b.due_date).getTime()
+    );
   };
 
   const filteredAssignments = getFilteredAssignments();
 
+
   return (
     <div className="space-y-6">
-      {/* Dashboard Stats Cards */}
-      {dashboardData.user_stats && (
-        <div className="grid grid-cols-2 gap-4 px-5">
-          <div className="bg-gradient-to-r from-blue-600 to-blue-500 rounded-2xl p-4">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
-                <BookOpen size={20} className="text-white" />
-              </div>
-              <div>
-                <div className="text-white text-2xl font-bold">
-                  {dashboardData.user_stats.enrollments_count}
-                </div>
-                <div className="text-blue-100 text-sm">Enrolled Courses</div>
-              </div>
-            </div>
-          </div>
-          
-          <div className="bg-gradient-to-r from-green-600 to-green-500 rounded-2xl p-4">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
-                <Trophy size={20} className="text-white" />
-              </div>
-              <div>
-                <div className="text-white text-2xl font-bold">
-                  {dashboardData.user_stats.completed_assignments}
-                </div>
-                <div className="text-green-100 text-sm">Completed</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Timetable action placed above the class block */}
+      <div className="px-5 flex justify-end">
+        <button 
+          onClick={() => onNavigate('timetable')}
+          className="text-blue-400 text-sm hover:text-blue-300 transition-colors"
+        >
+          View Full Timetable
+        </button>
+      </div>
 
-      {/* Current Class */}
+      {/* Ongoing/Upcoming Classes Block */}
       {currentClass && (
-        <div className="px-5">
-          <h2 className="text-white text-xl font-bold mb-4">Current Class</h2>
-          <CurrentClass 
-            className={currentClass.courses?.name || currentClass.name || 'Current Class'}
-            room={currentClass.room || 'Room TBA'}
-            instructor={currentClass.instructor || 'Instructor TBA'}
-            timeRemaining="Live now"
-          />
-        </div>
+        <CurrentClass 
+          className={currentClass.courses?.name || currentClass.name || 'Current Class'}
+          room={currentClass.room || ''}
+          instructor={currentClass.instructor || ''}
+          timeRemaining={(currentClass as any).time_remaining || 'Live now'}
+          status="ongoing"
+          progressPercentage={(currentClass as any).progress_percentage || 0}
+        />
       )}
 
-      {/* Next Class */}
       {nextClass && !currentClass && (
-        <div className="px-5">
-          <h2 className="text-white text-xl font-bold mb-4">Next Class</h2>
-          <CurrentClass 
-            className={nextClass.courses?.name || nextClass.name || 'Next Class'}
-            room={nextClass.room || 'Room TBA'}
-            instructor={nextClass.instructor || 'Instructor TBA'}
-            timeRemaining={`Starts at ${new Date(nextClass.start_time).toLocaleTimeString('en-US', { 
-              hour: 'numeric', 
-              minute: '2-digit',
-              hour12: true 
-            })}`}
-          />
-        </div>
+        <CurrentClass 
+          className={nextClass.courses?.name || nextClass.name || 'Next Class'}
+          room={nextClass.room || ''}
+          instructor={nextClass.instructor || ''}
+          timeRemaining={(nextClass as any).time_until || `Starts at ${new Date(nextClass.start_time).toLocaleTimeString('en-US', { 
+            hour: 'numeric', 
+            minute: '2-digit',
+            hour12: true 
+          })}`}
+          status="upcoming"
+        />
       )}
 
-      {/* Today's Schedule Overview */}
-      {todayClasses.length > 0 && (
-        <div className="px-5">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-white text-xl font-bold">Today's Schedule</h2>
-            <button 
-              onClick={() => onNavigate('timetable')}
-              className="text-blue-400 text-sm hover:text-blue-300 transition-colors"
-            >
-              View Full Timetable
-            </button>
-          </div>
-          
-          <div className="bg-gray-800 rounded-2xl p-4 space-y-3">
-            {todayClasses.slice(0, 3).map((classItem, index) => (
-              <div key={classItem.id || index} className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-2 h-2 rounded-full bg-blue-500"></div>
-                  <div>
-                    <div className="text-white font-medium text-sm">
-                      {classItem.courses?.name || classItem.name}
-                    </div>
-                    <div className="text-gray-400 text-xs">{classItem.room}</div>
-                  </div>
-                </div>
-                <div className="text-gray-300 text-sm">
-                  {new Date(classItem.start_time).toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
-                    minute: '2-digit',
-                    hour12: true 
-                  })}
-                </div>
-              </div>
-            ))}
-            
-            {todayClasses.length > 3 && (
-              <div className="text-center pt-2">
-                <button 
-                  onClick={() => onNavigate('timetable')}
-                  className="text-blue-400 text-sm hover:text-blue-300 transition-colors"
-                >
-                  +{todayClasses.length - 3} more classes
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
-      {/* Urgent Assignments */}
-      {dashboardData.upcoming_deadlines.length > 0 && (
-        <div className="px-5">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <AlertCircle size={20} className="text-yellow-500" />
-              <h2 className="text-white text-xl font-bold">Urgent Deadlines</h2>
-            </div>
-            <span className="text-yellow-400 text-sm">Next 7 days</span>
-          </div>
-          
-          <div className="space-y-3">
-            {dashboardData.upcoming_deadlines.slice(0, 2).map((assignment) => (
-              <AssignmentCard
-                key={assignment.id}
-                assignment={assignment}
-                onClick={() => onNavigate('assignments')}
-              />
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Assignment Timeframe Filter */}
       <div className="px-5">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-white text-xl font-bold">Assignments</h2>
+          <h2 className="text-white text-xl font-bold">Upcoming Assignments</h2>
           
-          <div className="flex bg-gray-800 rounded-lg p-1">
-            {(['today', 'week', 'month'] as const).map((timeframe) => (
-              <button
-                key={timeframe}
-                onClick={() => setSelectedTimeframe(timeframe)}
-                className={`px-3 py-1 rounded-md text-sm font-medium transition-colors ${
-                  selectedTimeframe === timeframe
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-              >
-                {timeframe.charAt(0).toUpperCase() + timeframe.slice(1)}
-              </button>
-            ))}
-          </div>
+          <button 
+            onClick={() => onNavigate('assignments')}
+            className="text-blue-400 text-sm hover:text-blue-300 transition-colors"
+          >
+            View Full Assignments
+          </button>
         </div>
 
         {filteredAssignments.length > 0 ? (
           <div className="space-y-3">
-            {filteredAssignments.map((assignment) => (
+            {filteredAssignments.slice(0, 2).map((assignment) => (
               <AssignmentCard
                 key={assignment.id}
                 assignment={assignment}
@@ -270,10 +204,46 @@ export function Dashboard({ onNavigate }: DashboardProps) {
           <div className="bg-gray-800 rounded-2xl p-6 text-center">
             <Calendar className="w-8 h-8 text-gray-500 mx-auto mb-3" />
             <div className="text-gray-400 text-sm">
-              No assignments due {selectedTimeframe === 'today' ? 'today' : `this ${selectedTimeframe}`}
+              No assignments available
             </div>
           </div>
         )}
+      </div>
+
+      {/* Upcoming Events Preview (calendar events only) */}
+      <div className="px-5">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-white text-xl font-bold">Upcoming Events</h2>
+          <button 
+            onClick={() => onNavigate('calendar')}
+            className="text-blue-400 text-sm hover:text-blue-300 transition-colors"
+          >
+            View Full Calendar
+          </button>
+        </div>
+        
+        <div className="bg-gray-800 rounded-2xl p-4">
+          <div className="space-y-3">
+            {/* Show only two calendar events (includes personal) */}
+            {upcomingCalendarEvents.length > 0 ? (
+              upcomingCalendarEvents.map((evt, idx) => (
+                <div key={idx} className="flex items-center gap-3 py-2 bg-gray-700 rounded-lg px-3">
+                  <div className={`w-2 h-2 rounded-full bg-green-400`}></div>
+                  <div className="flex-1">
+                    <div className="text-white text-sm font-medium">{evt.title}</div>
+                    {evt.subtitle && (<div className="text-gray-400 text-xs">{evt.subtitle}</div>)}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="text-center py-6">
+                <Calendar className="w-8 h-8 text-gray-500 mx-auto mb-3" />
+                <div className="text-gray-400 text-sm">No upcoming events</div>
+                <div className="text-gray-500 text-xs mt-1">Check your full calendar for future events</div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Quick Stats */}
@@ -299,23 +269,7 @@ export function Dashboard({ onNavigate }: DashboardProps) {
         </div>
       )}
 
-      {/* Debug Information (Development only) */}
-      {process.env.NODE_ENV === 'development' && (
-        <div className="px-5">
-          <div className="bg-gray-800 rounded-xl p-4">
-            <h3 className="text-white font-semibold mb-2">Dashboard Debug Info</h3>
-            <div className="text-gray-400 text-xs space-y-1">
-              <div>Recent Classes: {dashboardData.recent_classes.length}</div>
-              <div>Recent Assignments: {dashboardData.recent_assignments.length}</div>
-              <div>Today's Classes: {todayClasses.length}</div>
-              <div>Due Today: {dueToday.length}</div>
-              <div>Upcoming Deadlines: {dashboardData.upcoming_deadlines.length}</div>
-              <div>Current Session: {dashboardData.current_session ? 'Yes' : 'No'}</div>
-              <div>User Stats: {dashboardData.user_stats ? 'Available' : 'Not Available'}</div>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Debug info removed */}
     </div>
   );
 }

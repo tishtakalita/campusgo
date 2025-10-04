@@ -37,18 +37,44 @@ export interface Project {
   progress: number;
 }
 
+// Legacy interfaces for backward compatibility
+export interface LegacyClass {
+  id: string;
+  name: string;
+  code: string;
+  instructor: string;
+  room: string;
+  schedule: {
+    day: string;
+    startTime: string;
+    endTime: string;
+  }[];
+  students: string[];
+}
+
+export interface LegacyAssignment {
+  id: string;
+  title: string;
+  description: string;
+  subject: string;
+  classId: string;
+  dueDate: string;
+  priority: 'low' | 'medium' | 'high';
+  submittedBy: string[];
+}
+
 interface DataContextType {
-  classes: Class[];
-  assignments: Assignment[];
+  classes: LegacyClass[];
+  assignments: LegacyAssignment[];
   resources: Resource[];
   projects: Project[];
   isLoading: boolean;
   error: string | null;
-  addClass: (classData: Omit<Class, 'id'>) => void;
-  addAssignment: (assignment: Omit<Assignment, 'id'>) => void;
+  addClass: (classData: Omit<LegacyClass, 'id'>) => void;
+  addAssignment: (assignment: Omit<LegacyAssignment, 'id'>) => void;
   addResource: (resource: Omit<Resource, 'id'>) => void;
   addProject: (project: Omit<Project, 'id'>) => void;
-  updateAssignment: (id: string, updates: Partial<Assignment>) => void;
+  updateAssignment: (id: string, updates: Partial<LegacyAssignment>) => void;
   updateProject: (id: string, updates: Partial<Project>) => void;
   deleteAssignment: (id: string) => void;
   deleteResource: (id: string) => void;
@@ -75,78 +101,9 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Data states - start with mock data as fallback
-  const [classes, setClasses] = useState<Class[]>([
-    {
-      id: '1',
-      name: 'Machine Learning Fundamentals',
-      code: 'CS501',
-      instructor: 'Dr. Sarah Chen',
-      room: 'Room 101',
-      schedule: [
-        { day: 'Monday', startTime: '09:00', endTime: '10:30' },
-        { day: 'Wednesday', startTime: '09:00', endTime: '10:30' },
-        { day: 'Friday', startTime: '09:00', endTime: '10:30' }
-      ],
-      students: ['student1', 'student2', 'student3']
-    },
-    {
-      id: '2',
-      name: 'Deep Learning',
-      code: 'CS502',
-      instructor: 'Dr. Michael Brown',
-      room: 'Room 102',
-      schedule: [
-        { day: 'Tuesday', startTime: '14:00', endTime: '15:30' },
-        { day: 'Thursday', startTime: '14:00', endTime: '15:30' }
-      ],
-      students: ['student1', 'student4', 'student5']
-    },
-    {
-      id: '3',
-      name: 'AI Ethics',
-      code: 'CS503',
-      instructor: 'Dr. Emily Davis',
-      room: 'Room 103',
-      schedule: [
-        { day: 'Wednesday', startTime: '11:00', endTime: '12:30' }
-      ],
-      students: ['student1', 'student2', 'student6']
-    }
-  ]);
-
-  const [assignments, setAssignments] = useState<Assignment[]>([
-    {
-      id: '1',
-      title: 'Neural Network Implementation',
-      description: 'Implement a basic neural network from scratch',
-      subject: 'Deep Learning',
-      classId: '2',
-      dueDate: '2025-09-20',
-      priority: 'high',
-      submittedBy: []
-    },
-    {
-      id: '2',
-      title: 'Ethics in AI Essay',
-      description: 'Write a 2000-word essay on AI ethics',
-      subject: 'AI Ethics',
-      classId: '3',
-      dueDate: '2025-09-22',
-      priority: 'medium',
-      submittedBy: []
-    },
-    {
-      id: '3',
-      title: 'Database Design Project',
-      description: 'Design a database schema for an e-commerce platform',
-      subject: 'Database Systems',
-      classId: '1',
-      dueDate: '2025-09-25',
-      priority: 'low',
-      submittedBy: []
-    }
-  ]);
+  // Data states - initialize empty, will be populated from API  
+  const [classes, setClasses] = useState<LegacyClass[]>([]);
+  const [assignments, setAssignments] = useState<LegacyAssignment[]>([]);
 
   // Load data from API on component mount
   useEffect(() => {
@@ -156,34 +113,79 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
   const loadInitialData = async () => {
     setIsLoading(true);
     setError(null);
+    
     try {
-      // Load classes and assignments in parallel
-      const [classesResponse, assignmentsResponse] = await Promise.all([
-        classesAPI.getAllClasses(),
-        assignmentsAPI.getAllAssignments()
+      console.log('🔄 Loading initial data from API...');
+      
+      // Load all data in parallel
+      const [classesResponse, assignmentsResponse, resourcesResponse, projectsResponse] = await Promise.all([
+        classesAPI.getAllClasses().catch(err => ({ error: err.message, data: null })),
+        assignmentsAPI.getAllAssignments().catch(err => ({ error: err.message, data: null })),
+        resourcesAPI.getAllResources().catch(err => ({ error: err.message, data: null })),
+        projectsAPI.getAllProjects().catch(err => ({ error: err.message, data: null }))
       ]);
 
-      // Update classes if API call successful
+      let hasErrors = false;
+      let loadedCount = 0;
+
+      // Handle classes
       if (!classesResponse.error && classesResponse.data?.classes) {
         const transformedClasses = transformApiClasses(classesResponse.data.classes);
         setClasses(transformedClasses);
+        loadedCount++;
+        console.log(`✅ Loaded ${transformedClasses.length} classes`);
+      } else {
+        console.warn('❌ Failed to load classes:', classesResponse.error);
+        hasErrors = true;
       }
 
-      // Update assignments if API call successful
+      // Handle assignments
       if (!assignmentsResponse.error && assignmentsResponse.data?.assignments) {
         const transformedAssignments = transformApiAssignments(assignmentsResponse.data.assignments);
         setAssignments(transformedAssignments);
+        loadedCount++;
+        console.log(`✅ Loaded ${transformedAssignments.length} assignments`);
+      } else {
+        console.warn('❌ Failed to load assignments:', assignmentsResponse.error);
+        hasErrors = true;
       }
 
-      // Set error if both API calls failed
-      if (classesResponse.error && assignmentsResponse.error) {
-        setError('Failed to load data from server. Using cached data.');
+      // Handle resources
+      if (!resourcesResponse.error && resourcesResponse.data?.resources) {
+        const transformedResources = transformApiResources(resourcesResponse.data.resources);
+        setResources(transformedResources);
+        loadedCount++;
+        console.log(`✅ Loaded ${transformedResources.length} resources`);
+      } else {
+        console.warn('❌ Failed to load resources:', resourcesResponse.error);
+        hasErrors = true;
       }
+
+      // Handle projects
+      if (!projectsResponse.error && projectsResponse.data?.projects) {
+        const transformedProjects = transformApiProjects(projectsResponse.data.projects);
+        setProjects(transformedProjects);
+        loadedCount++;
+        console.log(`✅ Loaded ${transformedProjects.length} projects`);
+      } else {
+        console.warn('❌ Failed to load projects:', projectsResponse.error);
+        hasErrors = true;
+      }
+
+      if (hasErrors && loadedCount === 0) {
+        setError('Failed to load data from server. Please check your connection.');
+      } else if (hasErrors) {
+        setError(`Partially loaded: ${loadedCount}/4 data types loaded successfully.`);
+      }
+
+      console.log(`📊 Data loading complete: ${loadedCount}/4 successful`);
+      
     } catch (err) {
-      console.error('Error loading initial data:', err);
-      setError('Network error. Using cached data.');
+      console.error('💥 Critical error loading initial data:', err);
+      setError('Network error. Please check if the backend server is running.');
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
   const transformApiClasses = (apiClasses: any[]) => {
@@ -198,11 +200,11 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
         startTime: apiClass.start_time,
         endTime: apiClass.end_time
       }],
-      students: [] // Mock for now
+      students: [] // Student list not included in classes API response
     }));
   };
 
-  const transformApiAssignments = (apiAssignments: any[]) => {
+  const transformApiAssignments = (apiAssignments: any[]): LegacyAssignment[] => {
     return apiAssignments.map(apiAssignment => ({
       id: apiAssignment.id,
       title: apiAssignment.title,
@@ -212,6 +214,55 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
       dueDate: apiAssignment.due_date,
       priority: apiAssignment.priority || 'medium' as 'low' | 'medium' | 'high',
       submittedBy: []
+    }));
+  };
+
+  const transformApiResources = (apiResources: any[]): Resource[] => {
+    return apiResources.map(apiResource => {
+      let resourceType: 'notes' | 'video' | 'link' | 'document' = 'document';
+      
+      switch (apiResource.resource_type) {
+        case 'video':
+          resourceType = 'video';
+          break;
+        case 'link':
+          resourceType = 'link';
+          break;
+        case 'document':
+        case 'pdf':
+          resourceType = 'notes';
+          break;
+        default:
+          resourceType = 'document';
+      }
+      
+      return {
+        id: apiResource.id,
+        title: apiResource.title,
+        type: resourceType,
+        url: apiResource.file_url || apiResource.external_url || '#',
+        description: apiResource.description || '',
+        classId: apiResource.course_id || '1',
+        uploadedBy: apiResource.uploader?.first_name ? 
+          `${apiResource.uploader.first_name} ${apiResource.uploader.last_name}` : 
+          'Unknown',
+        uploadDate: apiResource.created_at ? apiResource.created_at.split('T')[0] : '2025-09-01',
+        tags: apiResource.tags || []
+      };
+    });
+  };
+
+  const transformApiProjects = (apiProjects: any[]): Project[] => {
+    return apiProjects.map(apiProject => ({
+      id: apiProject.id,
+      title: apiProject.title,
+      description: apiProject.description || '',
+      classId: apiProject.course_id || '1',
+      assignedTo: [], // Will be populated from project members API
+      status: apiProject.status || 'not-started' as 'not-started' | 'in-progress' | 'completed',
+      dueDate: apiProject.due_date || '2025-12-31',
+      progress: apiProject.status === 'completed' ? 100 : 
+                apiProject.status === 'in-progress' ? 50 : 0
     }));
   };
 
@@ -232,41 +283,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
       if (classesResponse.error) {
         console.error('Error fetching classes:', classesResponse.error);
       } else if (classesResponse.data?.classes) {
-        const transformedClasses = classesResponse.data.classes.map((apiClass: any) => {
-          const dayNames = ['', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-          const dayName = typeof apiClass.day_of_week === 'number' ? 
-            dayNames[apiClass.day_of_week] : 
-            apiClass.day_of_week || 'Monday';
-          
-          // Extract time from ISO datetime
-          const startTime = apiClass.start_time ? 
-            new Date(apiClass.start_time).toLocaleTimeString('en-US', { 
-              hour: '2-digit', 
-              minute: '2-digit', 
-              hour12: false 
-            }) : '09:00';
-          
-          const endTime = apiClass.end_time ? 
-            new Date(apiClass.end_time).toLocaleTimeString('en-US', { 
-              hour: '2-digit', 
-              minute: '2-digit', 
-              hour12: false 
-            }) : '10:30';
-
-          return {
-            id: apiClass.id,
-            name: apiClass.courses?.name || apiClass.title || 'Unknown Course',
-            code: apiClass.courses?.code || 'N/A',
-            instructor: apiClass.instructor || 'TBA',
-            room: apiClass.room || 'TBA',
-            schedule: [{
-              day: dayName,
-              startTime: startTime,
-              endTime: endTime
-            }],
-            students: [] // Will be populated from enrollments later
-          };
-        });
+        const transformedClasses = transformApiClasses(classesResponse.data.classes);
         setClasses(transformedClasses);
       }
 
@@ -274,16 +291,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
       if (assignmentsResponse.error) {
         console.error('Error fetching assignments:', assignmentsResponse.error);
       } else if (assignmentsResponse.data?.assignments) {
-        const transformedAssignments = assignmentsResponse.data.assignments.map((apiAssignment: any) => ({
-          id: apiAssignment.id,
-          title: apiAssignment.title,
-          description: apiAssignment.description,
-          subject: apiAssignment.courses?.name || 'Unknown Subject',
-          classId: apiAssignment.course_id || '1',
-          dueDate: apiAssignment.due_date,
-          priority: apiAssignment.priority || 'medium' as 'low' | 'medium' | 'high',
-          submittedBy: []
-        }));
+        const transformedAssignments = transformApiAssignments(assignmentsResponse.data.assignments);
         setAssignments(transformedAssignments);
       }
 
@@ -291,19 +299,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
       if (resourcesResponse.error) {
         console.error('Error fetching resources:', resourcesResponse.error);
       } else if (resourcesResponse.data?.resources) {
-        const transformedResources = resourcesResponse.data.resources.map((apiResource: any) => ({
-          id: apiResource.id,
-          title: apiResource.title,
-          type: apiResource.resource_type === 'document' ? 'notes' : 
-                apiResource.resource_type === 'video' ? 'video' :
-                apiResource.resource_type === 'link' ? 'link' : 'document',
-          url: apiResource.url || '#',
-          description: apiResource.description || '',
-          classId: apiResource.course_id || '1',
-          uploadedBy: apiResource.uploaded_by || 'Unknown',
-          uploadDate: apiResource.created_at ? apiResource.created_at.split('T')[0] : '2025-09-01',
-          tags: []
-        }));
+        const transformedResources = transformApiResources(resourcesResponse.data.resources);
         setResources(transformedResources);
       }
 
@@ -311,17 +307,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
       if (projectsResponse.error) {
         console.error('Error fetching projects:', projectsResponse.error);
       } else if (projectsResponse.data?.projects) {
-        const transformedProjects = projectsResponse.data.projects.map((apiProject: any) => ({
-          id: apiProject.id,
-          title: apiProject.title,
-          description: apiProject.description || '',
-          classId: apiProject.course_id || '1',
-          assignedTo: [], // Will be populated from project members
-          status: apiProject.status || 'not-started' as 'not-started' | 'in-progress' | 'completed',
-          dueDate: apiProject.due_date || '2025-12-31',
-          progress: apiProject.status === 'completed' ? 100 : 
-                   apiProject.status === 'in-progress' ? 50 : 0
-        }));
+        const transformedProjects = transformApiProjects(projectsResponse.data.projects);
         setProjects(transformedProjects);
       }
 
@@ -333,75 +319,19 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
     }
   };
 
-  const [resources, setResources] = useState<Resource[]>([
-    {
-      id: '1',
-      title: 'Introduction to Neural Networks',
-      type: 'notes',
-      url: '/resources/neural-networks-intro.pdf',
-      description: 'Basic concepts and fundamentals',
-      classId: '1',
-      uploadedBy: 'Dr. Sarah Chen',
-      uploadDate: '2025-09-10',
-      tags: ['neural networks', 'basics', 'fundamentals']
-    },
-    {
-      id: '2',
-      title: 'Deep Learning Lecture Series',
-      type: 'video',
-      url: 'https://youtube.com/watch?v=example',
-      description: 'Complete video series on deep learning',
-      classId: '2',
-      uploadedBy: 'Dr. Michael Brown',
-      uploadDate: '2025-09-12',
-      tags: ['deep learning', 'video', 'lecture']
-    },
-    {
-      id: '3',
-      title: 'AI Ethics Guidelines',
-      type: 'document',
-      url: '/resources/ai-ethics-guidelines.pdf',
-      description: 'Comprehensive guide to AI ethics',
-      classId: '3',
-      uploadedBy: 'Dr. Emily Davis',
-      uploadDate: '2025-09-15',
-      tags: ['ethics', 'guidelines', 'ai']
-    }
-  ]);
+  const [resources, setResources] = useState<Resource[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
 
-  const [projects, setProjects] = useState<Project[]>([
-    {
-      id: '1',
-      title: 'Chatbot Development',
-      description: 'Build an AI-powered chatbot for customer service',
-      classId: '1',
-      assignedTo: ['student1', 'student2'],
-      status: 'in-progress',
-      dueDate: '2025-10-15',
-      progress: 45
-    },
-    {
-      id: '2',
-      title: 'Computer Vision App',
-      description: 'Develop an image recognition mobile application',
-      classId: '2',
-      assignedTo: ['student3', 'student4'],
-      status: 'not-started',
-      dueDate: '2025-11-01',
-      progress: 0
-    }
-  ]);
-
-  const addClass = (classData: Omit<Class, 'id'>) => {
-    const newClass: Class = {
+  const addClass = (classData: Omit<LegacyClass, 'id'>) => {
+    const newClass: LegacyClass = {
       ...classData,
       id: Date.now().toString()
     };
     setClasses(prev => [...prev, newClass]);
   };
 
-  const addAssignment = (assignment: Omit<Assignment, 'id'>) => {
-    const newAssignment: Assignment = {
+  const addAssignment = (assignment: Omit<LegacyAssignment, 'id'>) => {
+    const newAssignment: LegacyAssignment = {
       ...assignment,
       id: Date.now().toString()
     };
@@ -424,7 +354,7 @@ export const DataProvider: React.FC<DataProviderProps> = ({ children }) => {
     setProjects(prev => [...prev, newProject]);
   };
 
-  const updateAssignment = (id: string, updates: Partial<Assignment>) => {
+  const updateAssignment = (id: string, updates: Partial<LegacyAssignment>) => {
     setAssignments(prev => 
       prev.map(assignment => 
         assignment.id === id ? { ...assignment, ...updates } : assignment

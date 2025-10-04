@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useUser } from '../contexts/UserContext';
 import { useData } from '../contexts/DataContext';
+import { assignmentsAPI } from '../services/api';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -28,7 +29,7 @@ export const CreateAssignment: React.FC<CreateAssignmentProps> = ({ onBack }) =>
     user?.facultySubjects?.includes(cls.name)
   );
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     
     if (!title || !description || !classId || !dueDate) {
@@ -38,15 +39,43 @@ export const CreateAssignment: React.FC<CreateAssignmentProps> = ({ onBack }) =>
     const selectedClass = facultyClasses.find(cls => cls.id === classId);
     if (!selectedClass) return;
 
-    addAssignment({
-      title,
-      description,
-      subject: selectedClass.name,
-      classId,
-      dueDate,
-      priority,
-      submittedBy: []
-    });
+    try {
+      // Create assignment via backend API
+      const payload = {
+        // Prefer course_id if available, else pass class_id for backend to resolve
+        course_id: (selectedClass as any).course_id,
+        class_id: selectedClass.id,
+        title,
+        description,
+        due_date: dueDate,
+        total_points: 100,
+        assignment_type: 'homework',
+        priority,
+        created_by: user?.id,
+        is_published: true,
+      };
+      const res = await assignmentsAPI.createAssignment(payload as any);
+      if (res.error) {
+        console.error('Failed to create assignment:', res.error);
+        return;
+      }
+      // Optionally reflect in local context list
+      if (res.data?.assignment) {
+        addAssignment({
+          id: res.data.assignment.id,
+          title,
+          description,
+          subject: selectedClass.name,
+          classId,
+          dueDate,
+          priority,
+          submittedBy: []
+        } as any);
+      }
+    } catch (err) {
+      console.error('Error creating assignment:', err);
+      return;
+    }
 
     // Reset form
     setTitle('');

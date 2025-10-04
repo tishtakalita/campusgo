@@ -1,36 +1,45 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { UserProvider, useUser } from "./contexts/UserContext";
-import { DataProvider, useData } from "./contexts/DataContext";
+import { DataProvider } from "./contexts/DataContext";
 import { DashboardProvider } from "./contexts/DashboardContext";
 import { Auth } from "./components/Auth";
 import { Header } from "./components/Header";
-import { CurrentClass } from "./components/CurrentClass";
-import { AssignmentCard } from "./components/AssignmentCard";
 import { Dashboard } from "./components/Dashboard";
-import { QuickAccess } from "./components/QuickAccess";
 import { BottomNav } from "./components/BottomNav";
 import { Timetable } from "./components/Timetable";
 import { Resources } from "./components/Resources";
-import { AIChat } from "./components/AIChat";
 import { Profile } from "./components/Profile";
 import { Notifications } from "./components/Notifications";
 import { Search } from "./components/Search";
 import { Projects } from "./components/Projects";
 import { Files } from "./components/Files";
+import { AssignmentsList } from "./components/AssignmentsList";
 import { Ideas } from "./components/Ideas";
 import { FacultyDashboard } from "./components/FacultyDashboard";
 import { CreateAssignment } from "./components/CreateAssignment";
 import { UploadResource } from "./components/UploadResource";
 import { ManageClasses } from "./components/ManageClasses";
 import { MonitorProjects } from "./components/MonitorProjects";
+import { Calendar } from "./components/Calendar";
+import Chat from "./components/Chat";
 
-type ViewType = 'dashboard' | 'timetable' | 'resources' | 'profile' | 'notifications' | 'search' | 'projects' | 'files' | 'ideas' | 'create-assignment' | 'upload-resource' | 'manage-classes' | 'monitor-projects';
+type ViewType = 'dashboard' | 'timetable' | 'resources' | 'profile' | 'notifications' | 'search' | 'projects' | 'files' | 'ideas' | 'calendar' | 'chat' | 'assignments' | 'create-assignment' | 'upload-resource' | 'manage-classes' | 'monitor-projects';
 
 function AppContent() {
-  const { user, login } = useUser();
-  const { assignments } = useData();
+  const { user, isLoading, login } = useUser();
   const [currentView, setCurrentView] = useState<ViewType>('dashboard');
-  const [showChat, setShowChat] = useState(false);
+
+  // Show loading screen while checking authentication
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <p className="text-white text-lg">Loading CampusGo...</p>
+        </div>
+      </div>
+    );
+  }
 
   // If no user is logged in, show auth screen
   if (!user) {
@@ -57,18 +66,32 @@ function AppContent() {
 
     if (currentView === 'profile') {
       return (
-        <div className="min-h-screen bg-gray-900">
+        <div className="min-h-screen bg-gray-900 pb-20">
           <Profile onBack={() => setCurrentView('dashboard')} />
-          {showChat && <AIChat onClose={() => setShowChat(false)} />}
+          <BottomNav 
+            onHomeClick={() => setCurrentView('dashboard')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
+            currentView={currentView}
+          />
         </div>
       );
     }
 
     if (currentView === 'notifications') {
       return (
-        <div className="min-h-screen bg-gray-900">
+        <div className="min-h-screen bg-gray-900 pb-20">
           <Notifications onBack={() => setCurrentView('dashboard')} />
-          {showChat && <AIChat onClose={() => setShowChat(false)} />}
+          <BottomNav 
+            onHomeClick={() => setCurrentView('dashboard')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
+            currentView={currentView}
+          />
         </div>
       );
     }
@@ -78,14 +101,13 @@ function AppContent() {
         <div className="min-h-screen bg-gray-900 pb-20">
           <Timetable onBack={() => setCurrentView('dashboard')} />
           <BottomNav 
-            onChatClick={() => setShowChat(true)}
             onHomeClick={() => setCurrentView('dashboard')}
-            onTimetableClick={() => setCurrentView('timetable')}
-            onFilesClick={() => setCurrentView('files')}
-            onIdeasClick={() => setCurrentView('ideas')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
             currentView={currentView}
           />
-          {showChat && <AIChat onClose={() => setShowChat(false)} />}
         </div>
       );
     }
@@ -98,14 +120,29 @@ function AppContent() {
             onUploadResource={() => setCurrentView('upload-resource')}
           />
           <BottomNav 
-            onChatClick={() => setShowChat(true)}
             onHomeClick={() => setCurrentView('dashboard')}
-            onTimetableClick={() => setCurrentView('timetable')}
-            onFilesClick={() => setCurrentView('files')}
-            onIdeasClick={() => setCurrentView('ideas')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
             currentView={currentView}
           />
-          {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        </div>
+      );
+    }
+
+    if (currentView === 'chat') {
+      return (
+        <div className="min-h-screen bg-gray-900 pb-20">
+          <Chat />
+          <BottomNav 
+            onHomeClick={() => setCurrentView('dashboard')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
+            currentView={currentView}
+          />
         </div>
       );
     }
@@ -114,84 +151,162 @@ function AppContent() {
     return (
       <div className="min-h-screen bg-gray-900 pb-20">
         <Header 
-          userName={user.name}
-          userAvatar={user.avatar}
-          onSearchClick={() => setCurrentView('search')}
+          userName={user.name || 'Faculty'}
+          userAvatar={user.avatar || ''}
           onNotificationsClick={() => setCurrentView('notifications')}
           onProfileClick={() => setCurrentView('profile')}
         />
         
         <div className="px-5 mb-6">
-          <FacultyDashboard onNavigate={setCurrentView} />
+          <FacultyDashboard onNavigate={(view: string) => setCurrentView(view as ViewType)} />
         </div>
         
         <BottomNav 
-          onChatClick={() => setShowChat(true)}
           onHomeClick={() => setCurrentView('dashboard')}
-          onTimetableClick={() => setCurrentView('timetable')}
-          onFilesClick={() => setCurrentView('files')}
-          onIdeasClick={() => setCurrentView('ideas')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          showProjects={false}
           currentView={currentView}
         />
-        
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
       </div>
     );
   }
 
-  // Student views (using real assignment data from DataContext)
+  // Student views
 
   // Handle different views for students
   if (currentView === 'profile') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Profile onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
 
   if (currentView === 'notifications') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Notifications onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
 
   if (currentView === 'search') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Search onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
 
   if (currentView === 'projects') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Projects onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
 
   if (currentView === 'files') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Files onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
 
   if (currentView === 'ideas') {
     return (
-      <div className="min-h-screen bg-gray-900">
+      <div className="min-h-screen bg-gray-900 pb-20">
         <Ideas onBack={() => setCurrentView('dashboard')} />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
+      </div>
+    );
+  }
+
+  if (currentView === 'calendar') {
+    return (
+      <div className="min-h-screen bg-gray-900 pb-20">
+        <Calendar onNavigate={(view: string) => setCurrentView(view as ViewType)} />
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
+      </div>
+    );
+  }
+
+  if (currentView === 'assignments') {
+    return (
+      <div className="min-h-screen bg-gray-900 pb-20">
+        <AssignmentsList onBack={() => setCurrentView('dashboard')} />
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
+      </div>
+    );
+  }
+
+  if (currentView === 'chat') {
+    return (
+      <div className="min-h-screen bg-gray-900 pb-20">
+        <Chat />
+        <BottomNav 
+          onHomeClick={() => setCurrentView('dashboard')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
+          currentView={currentView}
+        />
       </div>
     );
   }
@@ -201,14 +316,12 @@ function AppContent() {
       <div className="min-h-screen bg-gray-900 pb-20">
         <Timetable onBack={() => setCurrentView('dashboard')} />
         <BottomNav 
-          onChatClick={() => setShowChat(true)}
           onHomeClick={() => setCurrentView('dashboard')}
-          onTimetableClick={() => setCurrentView('timetable')}
-          onFilesClick={() => setCurrentView('files')}
-          onIdeasClick={() => setCurrentView('ideas')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
           currentView={currentView}
         />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
       </div>
     );
   }
@@ -218,14 +331,12 @@ function AppContent() {
       <div className="min-h-screen bg-gray-900 pb-20">
         <Resources onBack={() => setCurrentView('dashboard')} />
         <BottomNav 
-          onChatClick={() => setShowChat(true)}
           onHomeClick={() => setCurrentView('dashboard')}
-          onTimetableClick={() => setCurrentView('timetable')}
-          onFilesClick={() => setCurrentView('files')}
-          onIdeasClick={() => setCurrentView('ideas')}
+          onResourcesClick={() => setCurrentView('resources')}
+          onChatClick={() => setCurrentView('chat')}
+          onProjectsClick={() => setCurrentView('projects')}
           currentView={currentView}
         />
-        {showChat && <AIChat onClose={() => setShowChat(false)} />}
       </div>
     );
   }
@@ -234,32 +345,21 @@ function AppContent() {
   return (
     <div className="min-h-screen bg-gray-900 pb-20">
       <Header 
-        userName={user.name}
-        userAvatar={user.avatar}
-        onSearchClick={() => setCurrentView('search')}
+        userName={user.name || 'Student'}
+        userAvatar={user.avatar || ''}
         onNotificationsClick={() => setCurrentView('notifications')}
         onProfileClick={() => setCurrentView('profile')}
       />
       
-      <Dashboard onNavigate={setCurrentView} />
-      
-      <QuickAccess 
-        onTimetableClick={() => setCurrentView('timetable')} 
-        onResourcesClick={() => setCurrentView('resources')}
-        onChatClick={() => setShowChat(true)}
-        onProjectsClick={() => setCurrentView('projects')}
-      />
+      <Dashboard onNavigate={(view: string) => setCurrentView(view as ViewType)} />
       
       <BottomNav 
-        onChatClick={() => setShowChat(true)}
         onHomeClick={() => setCurrentView('dashboard')}
-        onTimetableClick={() => setCurrentView('timetable')}
-        onFilesClick={() => setCurrentView('files')}
-        onIdeasClick={() => setCurrentView('ideas')}
+        onResourcesClick={() => setCurrentView('resources')}
+        onChatClick={() => setCurrentView('chat')}
+        onProjectsClick={() => setCurrentView('projects')}
         currentView={currentView}
       />
-      
-      {showChat && <AIChat onClose={() => setShowChat(false)} />}
     </div>
   );
 }

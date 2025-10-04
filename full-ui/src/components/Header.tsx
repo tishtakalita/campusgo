@@ -1,15 +1,13 @@
-import React from "react";
-import { Search, Bell, User } from "lucide-react";
+import { Bell } from "lucide-react";
 
 interface HeaderProps {
   userName: string;
   userAvatar: string;
-  onSearchClick: () => void;
   onNotificationsClick: () => void;
   onProfileClick: () => void;
 }
 
-export function Header({ userName, userAvatar, onSearchClick, onNotificationsClick, onProfileClick }: HeaderProps) {
+export function Header({ userName, userAvatar, onNotificationsClick, onProfileClick }: HeaderProps) {
   return (
     <div className="bg-gradient-to-r from-blue-900/50 to-gray-900 border-b border-white/10">
       <div className="px-5 py-4">
@@ -20,13 +18,6 @@ export function Header({ userName, userAvatar, onSearchClick, onNotificationsCli
           </div>
           
           <div className="flex items-center gap-3">
-            <button 
-              onClick={onSearchClick}
-              className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center hover:bg-white/20 transition-colors"
-            >
-              <Search size={18} className="text-gray-300" />
-            </button>
-            
             <button 
               onClick={onNotificationsClick}
               className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center hover:bg-white/20 transition-colors relative"

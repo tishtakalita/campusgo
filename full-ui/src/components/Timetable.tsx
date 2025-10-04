@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { ArrowLeft, Calendar, Clock, MapPin, Users } from "lucide-react";
 import { useUser } from "../contexts/UserContext";
 import { classesAPI, Class as ApiClass } from "../services/api";
@@ -9,8 +9,10 @@ interface TimetableProps {
 
 export function Timetable({ onBack }: TimetableProps) {
   const { user } = useUser();
-  const [activeView, setActiveView] = useState<'day' | 'week' | 'month'>('day');
+  const [activeView, setActiveView] = useState<'day' | 'week'>('day');
   const [apiClasses, setApiClasses] = useState<ApiClass[]>([]);
+  const [todayApiClasses, setTodayApiClasses] = useState<ApiClass[]>([]);
+  const [saturdayOverride, setSaturdayOverride] = useState<ApiClass[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -23,96 +25,134 @@ export function Timetable({ onBack }: TimetableProps) {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await classesAPI.getAllClasses();
-      if (response.error) {
-        console.error('Failed to load classes:', response.error);
-        setError(response.error);
-        setApiClasses([]); // Clear data on error
+      // Fetch both: all classes for week view and today's classes for day view
+      const [allRes, todayRes] = await Promise.all([
+        classesAPI.getAllClasses(),
+        classesAPI.getTodaysClasses(),
+      ]);
+
+      if (allRes.error) {
+        console.error('Failed to load classes (all):', allRes.error);
+        setError(allRes.error);
+        setApiClasses([]);
       } else {
-        setApiClasses(response.data?.classes || []);
+        setApiClasses(allRes.data?.classes || []);
+      }
+
+      if (todayRes.error) {
+        console.error('Failed to load today classes:', todayRes.error);
+        // Don't override existing error unless both fail
+        if (!allRes.error) setError(todayRes.error);
+        setTodayApiClasses([]);
+      } else {
+        setTodayApiClasses(todayRes.data?.classes || []);
+      }
+
+      // Also fetch this week's Saturday override so it's visible in Week view
+      try {
+        const now = new Date();
+        // Compute upcoming Saturday in this calendar week (Mon..Sun)
+        const day = now.getDay(); // 0=Sun..6=Sat
+        // Determine Monday start
+        const mondayOffset = ((day + 6) % 7); // days since Monday
+        const monday = new Date(now);
+        monday.setDate(now.getDate() - mondayOffset);
+        const saturday = new Date(monday);
+        saturday.setDate(monday.getDate() + 5); // Monday +5 = Saturday
+        const saturdayStr = `${saturday.getFullYear()}-${String(saturday.getMonth()+1).padStart(2,'0')}-${String(saturday.getDate()).padStart(2,'0')}`;
+        const satRes = await classesAPI.getClassesByDate(saturdayStr);
+        if (!satRes.error) {
+          setSaturdayOverride(satRes.data?.classes || []);
+        } else {
+          setSaturdayOverride([]);
+        }
+      } catch (e) {
+        console.warn('Failed to load Saturday override:', e);
+        setSaturdayOverride([]);
       }
     } catch (err) {
       console.error('Error loading classes:', err);
       setError('Network error - please check if backend is running');
-      setApiClasses([]); // Clear data on error
+      setApiClasses([]);
+      setTodayApiClasses([]);
     }
     setIsLoading(false);
   };
 
   // Transform API classes to match frontend format
   const transformApiClasses = (apiClassesList: ApiClass[]) => {
-    // Map day numbers to day names (1=Monday, 2=Tuesday, etc.)
-    const dayMap: Record<number, string> = {
-      1: 'Monday',
-      2: 'Tuesday', 
-      3: 'Wednesday',
-      4: 'Thursday',
-      5: 'Friday',
-      6: 'Saturday',
-      7: 'Sunday'
-    };
-
+    // Use ENUM day_of_week directly and parse "HH:MM:SS" time strings
     return apiClassesList.map(apiClass => {
-      // Extract time from datetime string (e.g., "2024-09-16T14:00:00" -> "14:00")
-      const startTime = apiClass.start_time ? new Date(apiClass.start_time).toTimeString().slice(0, 5) : '00:00';
-      const endTime = apiClass.end_time ? new Date(apiClass.end_time).toTimeString().slice(0, 5) : '00:00';
-      
-      // Handle day_of_week as either number or string
-      let dayName = 'Monday'; // default
-      if (typeof apiClass.day_of_week === 'number') {
-        dayName = dayMap[apiClass.day_of_week] || 'Monday';
-      } else if (typeof apiClass.day_of_week === 'string') {
-        const dayNum = parseInt(apiClass.day_of_week);
-        dayName = dayMap[dayNum] || apiClass.day_of_week;
+      // Parse "HH:MM:SS" to "HH:MM" for display
+      const startTime = apiClass.start_time ? apiClass.start_time.slice(0, 5) : '00:00';
+      const endTime = apiClass.end_time ? apiClass.end_time.slice(0, 5) : '00:00';
+      // Day name from either enum string or numeric (1..7)
+      const rawDay: any = (apiClass as any).day_of_week;
+      let dayName = 'Monday';
+      if (typeof rawDay === 'string' && rawDay) {
+        dayName = rawDay.charAt(0).toUpperCase() + rawDay.slice(1);
+      } else if (typeof rawDay === 'number') {
+        const names = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+        const idx = Math.max(0, Math.min(6, rawDay - 1));
+        dayName = names[idx] || 'Monday';
       }
-      
       return {
         id: apiClass.id,
         name: apiClass.courses?.name || apiClass.name || 'Untitled Class',
         code: apiClass.courses?.code || apiClass.code || '',
-        instructor: apiClass.instructor || 'TBA',
-        room: apiClass.room || 'TBA',
+        instructor: apiClass.instructor || '',
+        room: apiClass.room || '',
         schedule: [{
           day: dayName,
           startTime: startTime,
           endTime: endTime
         }],
-        students: [] // Mock for now since API doesn't return student list
+        students: []
       };
     });
   };
 
   // Use ONLY API data - NO FALLBACKS
   const allClasses = transformApiClasses(apiClasses);
+  const todayTransformed = (() => {
+    // For day view we rely on backend's /api/classes/today which already accounts for Saturday overrides.
+    // We'll transform and override the schedule day label to today's actual day name for display consistency.
+    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    return todayApiClasses.map(apiClass => {
+      const startTime = apiClass.start_time ? apiClass.start_time.slice(0, 5) : '00:00';
+      const endTime = apiClass.end_time ? apiClass.end_time.slice(0, 5) : '00:00';
+      return {
+        id: apiClass.id,
+        name: (apiClass as any).courses?.name || (apiClass as any).name || 'Untitled Class',
+        code: (apiClass as any).courses?.code || (apiClass as any).code || '',
+        instructor: (apiClass as any).instructor || '',
+        room: (apiClass as any).room || '',
+        schedule: [{ day: todayName, startTime, endTime }],
+        students: []
+      } as any;
+    });
+  })();
   
   // Filter classes based on user role
   const userClasses = user?.role === 'faculty' 
     ? allClasses.filter((cls: any) => user.facultySubjects?.includes(cls.name))
     : allClasses; // Students see all classes
 
-  // Get today's day name
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long' });
-  
-    // Use actual day - development mode disabled now that we have full timetable
-  const displayDay = today;
-  
-  // Get today's classes (match by day name, not specific date)
-  const todayClasses = userClasses.filter((cls: any) =>
-    cls.schedule.some((schedule: any) => schedule.day === displayDay)
-  ).map((cls: any) => {
-    const todaySchedule = cls.schedule.find((schedule: any) => schedule.day === displayDay)!;
-    
-    // Check if class is currently ongoing
+  // Prepare data for today's view from todayTransformed, and compute current/upcoming status
+  const todayClasses = (() => {
+    const base = (user?.role === 'faculty'
+      ? todayTransformed.filter((cls: any) => user.facultySubjects?.includes(cls.name))
+      : todayTransformed);
     const now = new Date();
     const currentTime = now.toTimeString().slice(0, 5);
-    const isCurrentClass = currentTime >= todaySchedule.startTime && currentTime <= todaySchedule.endTime;
-    
-    return {
-      ...cls,
-      schedule: todaySchedule,
-      status: isCurrentClass ? 'current' : 'upcoming'
-    };
-  }).sort((a: any, b: any) => a.schedule.startTime.localeCompare(b.schedule.startTime));
+    return base.map((cls: any) => {
+      const s = cls.schedule; // [{day, startTime, endTime}]
+      const start = s[0]?.startTime || '00:00';
+      const end = s[0]?.endTime || '23:59';
+      const isCurrent = currentTime >= start && currentTime <= end;
+      return { ...cls, schedule: s[0], status: isCurrent ? 'current' : 'upcoming' };
+    }).sort((a: any, b: any) => a.schedule.startTime.localeCompare(b.schedule.startTime));
+  })();
   
   // Debug logging
   useEffect(() => {
@@ -121,11 +161,13 @@ export function Timetable({ onBack }: TimetableProps) {
     console.log('- Raw API data sample:', apiClasses.slice(0, 2));
     console.log('- Transformed classes:', allClasses.length);
     console.log('- Transformed sample:', allClasses.slice(0, 2));
+    console.log('- Today API classes loaded:', todayApiClasses.length);
+    console.log('- Today transformed sample:', todayTransformed.slice(0, 2));
     console.log('- User role:', user?.role);
-    console.log('- Today is:', today);
+    console.log('- Today is:', new Date().toLocaleDateString('en-US', { weekday: 'long' }));
     console.log('- Today classes found:', todayClasses.length);
     console.log('- Today classes sample:', todayClasses.slice(0, 2));
-  }, [apiClasses, allClasses, user?.role, today, todayClasses]);
+  }, [apiClasses, allClasses, user?.role, todayApiClasses, todayTransformed, todayClasses]);
 
   const formatTime = (time: string) => {
     const [hours, minutes] = time.split(':');
@@ -153,6 +195,28 @@ export function Timetable({ onBack }: TimetableProps) {
   };
 
   const weekSchedule = getWeekView();
+  
+  // Transform Saturday override into the same structure used in week view if present
+  const saturdayOverrideTransformed = (() => {
+    if (!saturdayOverride?.length) return [] as any[];
+    const startEnd = (t?: string) => (t ? t.slice(0,5) : '00:00');
+    return saturdayOverride.map((apiClass: any) => ({
+      id: apiClass.id,
+      name: apiClass.courses?.name || apiClass.name || 'Untitled Class',
+      code: apiClass.courses?.code || apiClass.code || '',
+      instructor: apiClass.instructor || '',
+      room: apiClass.room || '',
+      schedule: { day: 'Saturday', startTime: startEnd(apiClass.start_time), endTime: startEnd(apiClass.end_time) }
+    }));
+  })();
+
+  // Replace Saturday in week view with override, if available
+  const weekScheduleWithSaturday = (() => {
+    if (!saturdayOverrideTransformed.length) return weekSchedule;
+    const clone: { [key: string]: any[] } = { ...weekSchedule };
+    clone['Saturday'] = [...saturdayOverrideTransformed].sort((a, b) => a.schedule.startTime.localeCompare(b.schedule.startTime));
+    return clone;
+  })();
 
   return (
     <div className="min-h-screen bg-gray-900">
@@ -166,7 +230,7 @@ export function Timetable({ onBack }: TimetableProps) {
         </button>
         
         <div className="flex bg-gray-800 rounded-2xl p-1">
-          {(['day', 'week', 'month'] as const).map((view) => (
+          {(['day', 'week'] as const).map((view) => (
             <button
               key={view}
               onClick={() => setActiveView(view)}
@@ -211,9 +275,7 @@ export function Timetable({ onBack }: TimetableProps) {
           <>
             <div className="flex items-center gap-3 mb-6">
               <Calendar size={20} className="text-gray-400" />
-              <h2 className="text-white text-lg font-semibold">
-                Today, {new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}
-              </h2>
+              <h2 className="text-white text-lg font-semibold">Today's Schedule</h2>
             </div>
             
             <div className="space-y-4">
@@ -240,7 +302,7 @@ export function Timetable({ onBack }: TimetableProps) {
                     <div className="flex items-start justify-between mb-3">
                       <div>
                         <h3 className="text-white font-semibold text-lg mb-1">{classItem.name}</h3>
-                        <p className="text-gray-400 text-sm">{classItem.instructor}</p>
+                        {classItem.instructor && <p className="text-gray-400 text-sm">{classItem.instructor}</p>}
                         <p className="text-gray-500 text-xs">{classItem.code}</p>
                       </div>
                       {classItem.status === 'current' && (
@@ -249,7 +311,6 @@ export function Timetable({ onBack }: TimetableProps) {
                         </span>
                       )}
                     </div>
-                    
                     <div className="flex items-center gap-4 text-sm">
                       <div className="flex items-center gap-2">
                         <Clock size={14} className="text-gray-400" />
@@ -257,10 +318,12 @@ export function Timetable({ onBack }: TimetableProps) {
                           {formatTime(classItem.schedule.startTime)} - {formatTime(classItem.schedule.endTime)}
                         </span>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <MapPin size={14} className="text-gray-400" />
-                        <span className="text-gray-300">{classItem.room}</span>
-                      </div>
+                      {classItem.room && (
+                        <div className="flex items-center gap-2">
+                          <MapPin size={14} className="text-gray-400" />
+                          <span className="text-gray-300">{classItem.room}</span>
+                        </div>
+                      )}
                       {user?.role === 'faculty' && (
                         <div className="flex items-center gap-2">
                           <Users size={14} className="text-gray-400" />
@@ -283,7 +346,7 @@ export function Timetable({ onBack }: TimetableProps) {
             </div>
             
             <div className="space-y-6">
-              {Object.entries(weekSchedule).map(([day, dayClasses]) => (
+              {Object.entries(weekScheduleWithSaturday).map(([day, dayClasses]) => (
                 <div key={day}>
                   <h3 className="text-white font-semibold mb-3">{day}</h3>
                   {dayClasses.length === 0 ? (
@@ -295,13 +358,17 @@ export function Timetable({ onBack }: TimetableProps) {
                           <div className="flex items-center justify-between">
                             <div>
                               <h4 className="text-white font-medium">{classItem.name}</h4>
-                              <p className="text-gray-400 text-sm">{classItem.instructor}</p>
+                              {classItem.instructor && (
+                                <p className="text-gray-400 text-sm">{classItem.instructor}</p>
+                              )}
                             </div>
                             <div className="text-right">
                               <p className="text-gray-300 text-sm">
                                 {formatTime(classItem.schedule.startTime)} - {formatTime(classItem.schedule.endTime)}
                               </p>
-                              <p className="text-gray-500 text-xs">{classItem.room}</p>
+                              {classItem.room && (
+                                <p className="text-gray-500 text-xs">{classItem.room}</p>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -314,22 +381,7 @@ export function Timetable({ onBack }: TimetableProps) {
           </>
         )}
 
-        {activeView === 'month' && (
-          <>
-            <div className="flex items-center gap-3 mb-6">
-              <Calendar size={20} className="text-gray-400" />
-              <h2 className="text-white text-lg font-semibold">
-                {new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
-              </h2>
-            </div>
-            
-            <div className="text-center py-12">
-              <Calendar className="w-16 h-16 text-gray-500 mx-auto mb-4" />
-              <h3 className="text-white font-semibold mb-2">Month View</h3>
-              <p className="text-gray-400 text-sm">Calendar view coming soon</p>
-            </div>
-          </>
-        )}
+
         </>
         )}
       </div>
