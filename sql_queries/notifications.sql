@@ -16,9 +16,10 @@ create table public.notifications (
   constraint notifications_pkey primary key (id),
   constraint notifications_assignment_fkey foreign KEY (assignment_id) references assignments (id) on update CASCADE on delete set null,
   constraint notifications_event_fkey foreign KEY (event_id) references events (id) on update CASCADE on delete set null,
-  constraint notifications_actor_fkey foreign KEY (actor_id) references users (id) on update CASCADE on delete set null,
   constraint notifications_recipient_fkey foreign KEY (recipient_id) references users (id) on update CASCADE on delete CASCADE,
+  constraint notifications_resource_id_fkey foreign KEY (resource_id) references resources (id),
   constraint notifications_satclass_fkey foreign KEY (saturday_row_id) references saturday_class (id) on update CASCADE on delete set null,
+  constraint notifications_actor_fkey foreign KEY (actor_id) references users (id) on update CASCADE on delete set null,
   constraint notifications_timetable_fkey foreign KEY (timetable_id) references timetable (id) on update CASCADE on delete set null
 ) TABLESPACE pg_default;
 
