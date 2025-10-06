@@ -122,10 +122,14 @@ export function AssignmentCard({ assignment, onClick }: AssignmentCardProps) {
           <div className="flex items-start mb-3 gap-3">
             <div className="flex-1">
               <div className="flex items-center gap-2 mb-2">
-                <TypeIcon size={14} className="text-gray-400" />
-                <span className="text-gray-400 text-xs uppercase tracking-wide font-semibold">
-                  {assignment.assignment_type}
-                </span>
+                {assignment.assignment_type && (
+                  <>
+                    <TypeIcon size={14} className="text-gray-400" />
+                    <span className="text-gray-400 text-xs uppercase tracking-wide font-semibold">
+                      {assignment.assignment_type}
+                    </span>
+                  </>
+                )}
                 <div className={`px-2 py-1 rounded-full text-xs font-medium ${statusConfig.className}`}>
                   {statusConfig.text}
                 </div>
@@ -161,10 +165,12 @@ export function AssignmentCard({ assignment, onClick }: AssignmentCardProps) {
                 </span>
               </div>
               
-              <div className="flex items-center gap-1">
-                <Trophy size={12} className="text-yellow-500" />
-                <span className="text-gray-300 text-sm font-medium">{assignment.total_points} pts</span>
-              </div>
+              {assignment.total_points !== undefined && (
+                <div className="flex items-center gap-1">
+                  <Trophy size={12} className="text-yellow-500" />
+                  <span className="text-gray-300 text-sm font-medium">{assignment.total_points} pts</span>
+                </div>
+              )}
             </div>
           </div>
         </div>

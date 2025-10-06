@@ -91,7 +91,10 @@ const Chat: React.FC = () => {
       const data = await response.json();
       
       if (response.ok) {
-        setMessages(data.messages || []);
+        const list = (data.messages || []) as Message[];
+        // Ensure ascending chronological order by local time
+        list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+        setMessages(list);
         // Only mark messages as read when explicitly requested (when user opens conversation)
         if (markAsRead) {
           markMessagesAsRead(friendId);
@@ -344,25 +347,37 @@ const Chat: React.FC = () => {
     }
   }, [selectedConversation, currentUserId]);
 
+  // Conversation preview timestamp (compact) and message bubble timestamp (detailed)
   const formatTime = (timestamp: string) => {
     const date = new Date(timestamp);
     const now = new Date();
+    const sameDay = date.toDateString() === now.toDateString();
     const diffMs = now.getTime() - date.getTime();
     const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    
-    if (diffDays === 0) {
-      return date.toLocaleTimeString('en-US', { 
-        hour: 'numeric', 
-        minute: '2-digit',
-        hour12: true 
-      });
-    } else if (diffDays === 1) {
-      return 'Yesterday';
-    } else if (diffDays < 7) {
-      return date.toLocaleDateString('en-US', { weekday: 'short' });
-    } else {
-      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (sameDay) {
+      return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
     }
+    if (diffDays === 1) {
+      return `Yesterday ${date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+    }
+    if (diffDays < 7) {
+      return `${date.toLocaleDateString('en-US', { weekday: 'short' })} ${date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+    }
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  };
+
+  const formatBubbleTime = (timestamp: string) => {
+    const date = new Date(timestamp);
+    // Messages: show time only
+    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  };
+
+  const toLocalDateKey = (ts: string) => {
+    const d = new Date(ts);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
   };
 
   const getDisplayName = (user: ApiUser) => {
@@ -683,20 +698,14 @@ const Chat: React.FC = () => {
                     <div className="space-y-4">
                       {messages.map((message, index) => {
                         const isOwn = message.sender_id === currentUserId;
-                        const showTimestamp = index === 0 || 
-                          new Date(messages[index - 1].created_at).getTime() - new Date(message.created_at).getTime() > 300000; // 5 minutes
+                        const isNewDay = index === 0 || toLocalDateKey(messages[index - 1].created_at) !== toLocalDateKey(message.created_at);
                         
                         return (
                           <div key={message.message_id}>
-                            {showTimestamp && (
+                            {isNewDay && (
                               <div className="text-center my-4">
                                 <span className="text-xs text-gray-500 bg-gray-800 px-3 py-1 rounded-full">
-                                  {new Date(message.created_at).toLocaleDateString('en-US', {
-                                    weekday: 'long',
-                                    year: 'numeric',
-                                    month: 'long',
-                                    day: 'numeric'
-                                  })}
+                                  {new Date(message.created_at).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
                                 </span>
                               </div>
                             )}
@@ -708,9 +717,7 @@ const Chat: React.FC = () => {
                                   : 'bg-gray-700 text-white rounded-bl-sm'
                               }`}>
                                 <p className="text-sm">{message.content}</p>
-                                <p className={`text-xs mt-1 ${isOwn ? 'text-green-100' : 'text-gray-400'}`}>
-                                  {formatTime(message.created_at)}
-                                </p>
+                                <p className={`text-xs mt-1 ${isOwn ? 'text-green-100' : 'text-gray-400'}`}>{formatBubbleTime(message.created_at)}</p>
                               </div>
                             </div>
                           </div>

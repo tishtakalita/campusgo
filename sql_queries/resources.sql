@@ -4,13 +4,15 @@ create table public.resources (
   description text null,
   file_url text not null,
   resource_type public.resource_type not null,
-  course_id uuid not null,
+  course_id uuid null,
   uploaded_by uuid not null,
   download_count integer null default 0,
   tags text[] null,
   created_at timestamp without time zone not null default CURRENT_TIMESTAMP,
   category public.resource_category not null default 'materials'::resource_category,
+  class character varying null,
   constraint resources_pkey primary key (id),
+  constraint resources_class_fkey foreign KEY (class) references class (class) on update CASCADE on delete CASCADE,
   constraint resources_course_id_fkey foreign KEY (course_id) references courses (id),
   constraint resources_uploaded_by_fkey foreign KEY (uploaded_by) references users (id) on update CASCADE on delete CASCADE
 ) TABLESPACE pg_default;

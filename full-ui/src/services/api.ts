@@ -69,13 +69,15 @@ export interface Class {
 export interface Assignment {
   id: string;
   course_id: string;
+  class?: string; // class code string (FK to class.class)
   title: string;
   description: string;
   due_date: string; // ISO datetime string
-  total_points: number;
-  assignment_type: 'homework' | 'lab' | 'project' | 'quiz' | 'exam';
-  priority: 'high' | 'medium' | 'low';
-  is_published: boolean;
+  // The following legacy fields may not exist in the minimal schema; keep optional for compatibility
+  total_points?: number;
+  assignment_type?: 'homework' | 'lab' | 'project' | 'quiz' | 'exam';
+  priority?: 'high' | 'medium' | 'low';
+  is_published?: boolean;
   created_by: string;
   created_at: string; // ISO datetime string
   courses?: {
@@ -256,7 +258,22 @@ function transformClasses(classes: any[]): Class[] {
 // Classes/Timetable API calls
 export const classesAPI = {
   async getAllClasses(): Promise<ApiResponse<{ classes: Class[] }>> {
-    const response = await apiRequest<{ classes: any[] }>('/api/classes');
+    // If current user is faculty, filter by their courses; if student, by their class via student_id
+    let endpoint = '/api/classes';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) {
+          const qs = new URLSearchParams({ faculty_id: u.id });
+          endpoint = `/api/classes?${qs.toString()}`;
+        } else if (u?.role === 'student' && u.id) {
+          const qs = new URLSearchParams({ student_id: u.id });
+          endpoint = `/api/classes?${qs.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ classes: any[] }>(endpoint);
     
     if (response.data?.classes) {
       response.data.classes = transformClasses(response.data.classes);
@@ -266,7 +283,22 @@ export const classesAPI = {
   },
 
   async getTodaysClasses(): Promise<ApiResponse<{ classes: Class[] }>> {
-    const response = await apiRequest<{ classes: any[] }>('/api/classes/today');
+    // If current user is faculty, filter by their courses; if student, by their class via student_id
+    let endpoint = '/api/classes/today';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) {
+          const qs = new URLSearchParams({ faculty_id: u.id });
+          endpoint = `/api/classes/today?${qs.toString()}`;
+        } else if (u?.role === 'student' && u.id) {
+          const qs = new URLSearchParams({ student_id: u.id });
+          endpoint = `/api/classes/today?${qs.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ classes: any[] }>(endpoint);
     
     if (response.data?.classes) {
       response.data.classes = transformClasses(response.data.classes);
@@ -296,7 +328,21 @@ export const classesAPI = {
   },
 
   async getCurrentClass(): Promise<ApiResponse<{ current_class: Class | null }>> {
-    const response = await apiRequest<{ current_class: any }>('/api/classes/current');
+    let endpoint = '/api/classes/current';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) {
+          const qs = new URLSearchParams({ faculty_id: u.id });
+          endpoint = `/api/classes/current?${qs.toString()}`;
+        } else if (u?.role === 'student' && u.id) {
+          const qs = new URLSearchParams({ student_id: u.id });
+          endpoint = `/api/classes/current?${qs.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ current_class: any }>(endpoint);
     
     if (response.data?.current_class) {
       response.data.current_class = transformClass(response.data.current_class);
@@ -306,7 +352,21 @@ export const classesAPI = {
   },
 
   async getNextClass(): Promise<ApiResponse<{ next_class: Class | null }>> {
-    const response = await apiRequest<{ next_class: any }>('/api/classes/next');
+    let endpoint = '/api/classes/next';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) {
+          const qs = new URLSearchParams({ faculty_id: u.id });
+          endpoint = `/api/classes/next?${qs.toString()}`;
+        } else if (u?.role === 'student' && u.id) {
+          const qs = new URLSearchParams({ student_id: u.id });
+          endpoint = `/api/classes/next?${qs.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ next_class: any }>(endpoint);
     
     if (response.data?.next_class) {
       response.data.next_class = transformClass(response.data.next_class);
@@ -329,6 +389,14 @@ export const classesAPI = {
     // Use path-param endpoint to avoid conflict with /api/classes/{class_id}
     const qs = new URLSearchParams();
     if (section) qs.set('section', section);
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) qs.set('faculty_id', u.id);
+        else if (u?.role === 'student' && u.id) qs.set('student_id', u.id);
+      }
+    } catch {}
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     const response = await apiRequest<{ classes: any[] }>(`/api/classes/date/${encodeURIComponent(date)}${suffix}`);
     if (response.data?.classes) {
@@ -425,7 +493,20 @@ function transformAssignments(assignments: any[]): Assignment[] {
 // Assignments API calls
 export const assignmentsAPI = {
   async getAllAssignments(): Promise<ApiResponse<{ assignments: Assignment[] }>> {
-    const response = await apiRequest<{ assignments: any[] }>('/api/assignments');
+    let endpoint = '/api/assignments';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) {
+          const params = new URLSearchParams();
+          if (u.role === 'faculty') params.set('faculty_id', u.id);
+          if (u.role === 'student') params.set('student_id', u.id);
+          if (Array.from(params.keys()).length) endpoint = `/api/assignments?${params.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ assignments: any[] }>(endpoint);
     
     if (response.data?.assignments) {
       response.data.assignments = transformAssignments(response.data.assignments);
@@ -435,7 +516,20 @@ export const assignmentsAPI = {
   },
 
   async getUpcomingAssignments(): Promise<ApiResponse<{ assignments: Assignment[] }>> {
-    const response = await apiRequest<{ assignments: any[] }>('/api/assignments/upcoming');
+    let endpoint = '/api/assignments/upcoming';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) {
+          const params = new URLSearchParams();
+          if (u.role === 'faculty') params.set('faculty_id', u.id);
+          if (u.role === 'student') params.set('student_id', u.id);
+          if (Array.from(params.keys()).length) endpoint = `/api/assignments/upcoming?${params.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ assignments: any[] }>(endpoint);
     
     if (response.data?.assignments) {
       response.data.assignments = transformAssignments(response.data.assignments);
@@ -445,7 +539,20 @@ export const assignmentsAPI = {
   },
 
   async getOverdueAssignments(): Promise<ApiResponse<{ assignments: Assignment[] }>> {
-    const response = await apiRequest<{ assignments: any[] }>('/api/assignments/overdue');
+    let endpoint = '/api/assignments/overdue';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) {
+          const params = new URLSearchParams();
+          if (u.role === 'faculty') params.set('faculty_id', u.id);
+          if (u.role === 'student') params.set('student_id', u.id);
+          if (Array.from(params.keys()).length) endpoint = `/api/assignments/overdue?${params.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ assignments: any[] }>(endpoint);
     
     if (response.data?.assignments) {
       response.data.assignments = transformAssignments(response.data.assignments);
@@ -504,12 +611,11 @@ export const assignmentsAPI = {
   // For faculty: Create new assignment
   async createAssignment(assignmentData: {
     course_id: string;
+    class?: string;
     title: string;
     description: string;
     due_date: string;
-    total_points: number;
-    assignment_type: string;
-    priority: string;
+    created_by?: string;
   }): Promise<ApiResponse<{ message: string; assignment: Assignment }>> {
     return apiRequest('/api/assignments', {
       method: 'POST',
@@ -518,7 +624,17 @@ export const assignmentsAPI = {
   },
 
   // For faculty: Update assignment
-  async updateAssignment(assignmentId: string, assignmentData: Partial<Assignment>): Promise<ApiResponse<{ message: string; assignment: Assignment }>> {
+  async updateAssignment(assignmentId: string, assignmentData: Partial<Assignment> & { user_id?: string }): Promise<ApiResponse<{ message: string; assignment: Assignment }>> {
+    // Attach user_id for ownership checks if not provided
+    try {
+      if (!assignmentData.user_id) {
+        const storedUser = localStorage.getItem('campusgo_user');
+        if (storedUser) {
+          const u = JSON.parse(storedUser) as User;
+          if (u?.id) (assignmentData as any).user_id = u.id;
+        }
+      }
+    } catch {}
     return apiRequest(`/api/assignments/${assignmentId}`, {
       method: 'PUT',
       body: JSON.stringify(assignmentData),
@@ -527,9 +643,24 @@ export const assignmentsAPI = {
 
   // For faculty: Delete assignment
   async deleteAssignment(assignmentId: string): Promise<ApiResponse<{ message: string }>> {
-    return apiRequest(`/api/assignments/${assignmentId}`, {
-      method: 'DELETE',
-    });
+    // Pass user_id as query param for backend enforcement
+    const params = new URLSearchParams();
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) params.set('user_id', u.id);
+      }
+    } catch {}
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/assignments/${assignmentId}${suffix}`, { method: 'DELETE' });
+  },
+
+  async getMyAssignments(userId: string): Promise<ApiResponse<{ assignments: Assignment[] }>> {
+    const qs = new URLSearchParams({ user_id: userId });
+    const response = await apiRequest<{ assignments: any[] }>(`/api/assignments/my?${qs.toString()}`);
+    if (response.data?.assignments) response.data.assignments = transformAssignments(response.data.assignments);
+    return response as ApiResponse<{ assignments: Assignment[] }>;
   },
 };
 
@@ -546,12 +677,26 @@ export const dashboardAPI = {
       completed_assignments: number;
     };
   }>> {
+    // Pass role-based filters to get scoped assignments in dashboard when needed
+    let endpoint = '/api/dashboard';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) {
+          const params = new URLSearchParams();
+          if (u.role === 'faculty') params.set('faculty_id', u.id);
+          if (u.role === 'student') params.set('student_id', u.id);
+          if (Array.from(params.keys()).length) endpoint = `/api/dashboard?${params.toString()}`;
+        }
+      }
+    } catch {}
     const response = await apiRequest<{
       current_session: any;
       recent_classes: any[];
       recent_assignments: any[];
       user_stats?: any;
-    }>('/api/dashboard');
+    }>(endpoint);
 
     // Transform the data for better frontend consumption
     if (response.data) {
@@ -590,7 +735,21 @@ export const dashboardAPI = {
   },
 
   async getUpcomingDeadlines(): Promise<ApiResponse<{ assignments: Assignment[] }>> {
-    const response = await apiRequest<{ assignments: any[] }>('/api/assignments/upcoming');
+    // Include role-based scoping so faculty see only their course assignments
+    let endpoint = '/api/assignments/upcoming';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) {
+          const params = new URLSearchParams();
+          if (u.role === 'faculty') params.set('faculty_id', u.id);
+          if (u.role === 'student') params.set('student_id', u.id);
+          if (Array.from(params.keys()).length) endpoint = `/api/assignments/upcoming?${params.toString()}`;
+        }
+      }
+    } catch {}
+    const response = await apiRequest<{ assignments: any[] }>(endpoint);
     
     if (response.data?.assignments) {
       // Filter to only next 7 days and transform
@@ -599,7 +758,7 @@ export const dashboardAPI = {
         .filter(assignment => new Date(assignment.due_date) <= weekFromNow)
         .slice(0, 5); // Limit to 5 most urgent
       
-      response.data.assignments = transformAssignments(upcomingAssignments);
+  response.data.assignments = transformAssignments(upcomingAssignments);
     }
     
     return response as ApiResponse<{ assignments: Assignment[] }>;
@@ -684,6 +843,7 @@ export interface Resource {
   description: string;
   resource_type: 'document' | 'video' | 'link' | 'image' | 'slides' | 'other';
   category?: 'syllabus' | 'announcements' | 'materials';
+  class?: string | null; // class code string
   url?: string;
   file_url?: string; // S3 bucket URL
   file_name?: string;
@@ -743,11 +903,19 @@ export interface FileItem {
 export interface Notification {
   id: string;
   title: string;
-  message: string;
-  notification_type: 'assignment' | 'class' | 'announcement' | 'system';
+  message?: string | null;
+  notif_type: 'assignment' | 'event' | 'resource' | 'timetable' | 'saturday_class' | 'chat' | 'friend_request' | 'system';
   recipient_id?: string;
+  actor_id?: string;
   is_read?: boolean;
   created_at?: string;
+  // optional navigation/context fields
+  resource_id?: string;
+  assignment_id?: string;
+  event_id?: string;
+  timetable_id?: string;
+  saturday_row_id?: string;
+  meta?: Record<string, any>;
 }
 
 export interface Idea {
@@ -771,21 +939,15 @@ export interface CalendarEvent {
   id?: string;
   title: string;
   description?: string;
-  event_type: string; // 'event' | 'assignment' | 'exam' | 'class' | 'meeting' | 'personal' | ...
   start_date: string; // YYYY-MM-DD
-  end_date?: string; // YYYY-MM-DD
   start_time?: string; // HH:MM:SS
   end_time?: string; // HH:MM:SS
   is_all_day?: boolean;
-  is_recurring?: boolean;
-  recurrence_type?: string;
-  recurrence_end_date?: string;
   priority?: string;
-  status?: string;
   color?: string; // '#RRGGBB'
   course_id?: string;
   assignment_id?: string;
-  class_id?: string;
+  class?: string; // class code string
   created_by?: string; // user id
   location?: string;
   is_personal?: boolean;
@@ -794,7 +956,27 @@ export interface CalendarEvent {
 // Resources API calls
 export const resourcesAPI = {
   async getAllResources(): Promise<ApiResponse<{ resources: Resource[] }>> {
-    return apiRequest('/api/resources');
+    // If current user is faculty, ask backend to return union of their uploads and their courses' resources
+    let endpoint = '/api/resources';
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.role === 'faculty' && u.id) {
+          const qs = new URLSearchParams({ faculty_id: u.id });
+          endpoint = `/api/resources?${qs.toString()}`;
+        } else if (u?.role === 'student' && u.id) {
+          const qs = new URLSearchParams({ student_id: u.id });
+          endpoint = `/api/resources?${qs.toString()}`;
+        }
+      }
+    } catch {}
+    return apiRequest(endpoint);
+  },
+
+  async getMyResources(userId: string): Promise<ApiResponse<{ resources: Resource[] }>> {
+    const qs = new URLSearchParams({ user_id: userId });
+    return apiRequest(`/api/resources/my?${qs.toString()}`);
   },
 
   async searchResources(query?: string): Promise<ApiResponse<{ resources: Resource[] }>> {
@@ -815,6 +997,7 @@ export const resourcesAPI = {
     description: string;
     resource_type: string;
     category?: 'syllabus' | 'announcements' | 'materials';
+    class?: string;
     file_url?: string;
     file_name?: string;
     file_size?: number;
@@ -830,7 +1013,17 @@ export const resourcesAPI = {
     });
   },
 
-  async updateResource(resourceId: string, resourceData: Partial<Resource>): Promise<ApiResponse<{ resource: Resource; message: string }>> {
+  async updateResource(resourceId: string, resourceData: Partial<Resource> & { user_id?: string }): Promise<ApiResponse<{ resource: Resource; message: string }>> {
+    // Attach user_id for backend ownership enforcement if not provided
+    try {
+      if (!resourceData.user_id) {
+        const storedUser = localStorage.getItem('campusgo_user');
+        if (storedUser) {
+          const u = JSON.parse(storedUser) as User;
+          if (u?.id) (resourceData as any).user_id = u.id;
+        }
+      }
+    } catch {}
     return apiRequest(`/api/resources/${resourceId}`, {
       method: 'PUT',
       body: JSON.stringify(resourceData),
@@ -838,9 +1031,17 @@ export const resourcesAPI = {
   },
 
   async deleteResource(resourceId: string): Promise<ApiResponse<{ message: string }>> {
-    return apiRequest(`/api/resources/${resourceId}`, {
-      method: 'DELETE',
-    });
+    // Append user_id as query param for backend enforcement
+    const params = new URLSearchParams();
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) params.set('user_id', u.id);
+      }
+    } catch {}
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/resources/${resourceId}${suffix}`, { method: 'DELETE' });
   },
 
   async trackDownload(resourceId: string): Promise<ApiResponse<{ message: string }>> {
@@ -903,13 +1104,37 @@ export const filesAPI = {
 
 // Notifications API calls
 export const notificationsAPI = {
-  async getAllNotifications(): Promise<ApiResponse<{ notifications: Notification[] }>> {
-    return apiRequest('/api/notifications');
+  async list(userId: string, unreadOnly?: boolean): Promise<ApiResponse<{ notifications: Notification[] }>> {
+    const params = new URLSearchParams();
+    if (userId) params.set('user_id', userId);
+    if (unreadOnly) params.set('unread_only', 'true');
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/notifications${qs}`);
   },
 
-  async getUnreadNotifications(): Promise<ApiResponse<{ notifications: Notification[] }>> {
-    return apiRequest('/api/notifications/unread');
+  async markRead(notificationId: string, userId?: string): Promise<ApiResponse<{ message: string; updated?: number }>> {
+    const params = new URLSearchParams();
+    if (userId) params.set('user_id', userId);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/notifications/${notificationId}/read${qs}`, { method: 'PUT' });
   },
+
+  async markAllRead(userId: string): Promise<ApiResponse<{ message: string; updated?: number }>> {
+    return apiRequest(`/api/notifications/read-all`, { method: 'PUT', body: JSON.stringify({ user_id: userId }) });
+  },
+
+  async delete(notificationId: string, userId?: string): Promise<ApiResponse<{ message: string }>> {
+    const params = new URLSearchParams();
+    if (userId) params.set('user_id', userId);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/notifications/${notificationId}${qs}`, { method: 'DELETE' });
+  },
+
+  async getUnreadCount(userId: string): Promise<number> {
+    const res = await notificationsAPI.list(userId, true);
+    if (res.error) return 0;
+    return res.data?.notifications?.length ?? 0;
+  }
 };
 
 // Ideas API calls
@@ -1131,13 +1356,18 @@ export const searchUtils = {
       
       byPriority: (assignments: Assignment[]) =>
         [...assignments].sort((a, b) => {
-          const priorityOrder = { high: 3, medium: 2, low: 1 };
-          return priorityOrder[b.priority] - priorityOrder[a.priority];
+          const priorityOrder: Record<string, number> = { high: 3, medium: 2, low: 1 };
+          const pa = a.priority ? priorityOrder[a.priority] : 0;
+          const pb = b.priority ? priorityOrder[b.priority] : 0;
+          return pb - pa;
         }),
       
       byPoints: (assignments: Assignment[], ascending = false) =>
-        [...assignments].sort((a, b) => 
-          ascending ? a.total_points - b.total_points : b.total_points - a.total_points)
+        [...assignments].sort((a, b) => {
+          const ap = a.total_points ?? 0;
+          const bp = b.total_points ?? 0;
+          return ascending ? ap - bp : bp - ap;
+        })
     },
 
     classes: {
@@ -1179,9 +1409,7 @@ export const calendarAPI = {
 
   async createEvent(event: CalendarEvent): Promise<ApiResponse<{ event: CalendarEvent; message: string }>> {
     // Client-side schema defaults to align with DB
-    event.event_type = (event.event_type || 'event') as any;
     if (event.priority == null) event.priority = 'medium' as any;
-    if (event.status == null) event.status = 'scheduled' as any;
     if (!event.color) event.color = '#3b82f6';
     const normTime = (v?: string) => (v && v.length === 5 && v.includes(':') ? `${v}:00` : v);
     if (event.start_time) event.start_time = normTime(event.start_time);
@@ -1206,22 +1434,22 @@ export const calendarAPI = {
 
   async updateEvent(eventId: string, event: Partial<CalendarEvent>): Promise<ApiResponse<{ event: CalendarEvent; message: string }>> {
     // Client-side normalization to match DB
-    if (event.event_type !== undefined) event.event_type = (event.event_type || 'event') as any;
     if (event.priority !== undefined && !event.priority) event.priority = 'medium' as any;
-    if (event.status !== undefined && !event.status) event.status = 'scheduled' as any;
     if (event.color !== undefined && !event.color) event.color = '#3b82f6';
     const normTime = (v?: string) => (v && v.length === 5 && v.includes(':') ? `${v}:00` : v);
     if (event.start_time !== undefined && event.start_time) event.start_time = normTime(event.start_time);
     if (event.end_time !== undefined && event.end_time) event.end_time = normTime(event.end_time);
 
-    // If current user is a student, ensure personal-only updates and pass user_id for backend enforcement
+    // Ensure backend knows acting user for ownership enforcement
     try {
       const storedUser = localStorage.getItem('campusgo_user');
       if (storedUser) {
         const u = JSON.parse(storedUser) as User;
+        // Always pass user_id for backend checks
+        (event as any).user_id = u?.id;
         if (u?.role === 'student') {
+          // Students can only manage personal events
           event.is_personal = true;
-          (event as any).user_id = u.id;
           if ('created_by' in event) delete (event as any).created_by;
         }
       }
@@ -1233,9 +1461,60 @@ export const calendarAPI = {
   },
 
   async deleteEvent(eventId: string): Promise<ApiResponse<{ message: string }>> {
-    return apiRequest(`/api/events/${eventId}`, {
-      method: 'DELETE',
-    });
+    // Append user_id for backend ownership enforcement
+    const params = new URLSearchParams();
+    try {
+      const storedUser = localStorage.getItem('campusgo_user');
+      if (storedUser) {
+        const u = JSON.parse(storedUser) as User;
+        if (u?.id) params.set('user_id', u.id);
+      }
+    } catch {}
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return apiRequest(`/api/events/${eventId}${suffix}`, { method: 'DELETE' });
+  },
+
+  async getMyEvents(userId: string): Promise<ApiResponse<{ events: CalendarEvent[] }>> {
+    const qs = new URLSearchParams({ user_id: userId });
+    return apiRequest(`/api/events/my?${qs.toString()}`);
+  },
+};
+
+export const adminAPI = {
+  async listTimetable(): Promise<ApiResponse<{ classes: any[] }>> {
+    return apiRequest('/api/classes');
+  },
+  async createTimetable(payload: {
+    course_id: string;
+    room: string;
+    class: string; // class code
+    start_time: string; // HH:MM[:SS]
+    end_time: string;   // HH:MM[:SS]
+    day_of_week: string; // monday..saturday
+  }): Promise<ApiResponse<{ timetable: any; message: string }>> {
+    return apiRequest('/api/admin/timetable', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  async updateTimetable(classId: string, payload: Partial<{ room: string; class: string; start_time: string; end_time: string; day_of_week: string }>): Promise<ApiResponse<{ message: string; class: any }>> {
+    return apiRequest(`/api/classes/${classId}`, { method: 'PUT', body: JSON.stringify(payload) });
+  },
+  async deleteTimetable(classId: string): Promise<ApiResponse<{ message: string }>> {
+    return apiRequest(`/api/classes/${classId}`, { method: 'DELETE' });
+  },
+  async listSaturday(): Promise<ApiResponse<{ saturday_class: any[] }>> {
+    return apiRequest('/api/saturday-class');
+  },
+  async createSaturdayClass(payload: {
+    date: string; // YYYY-MM-DD
+    class: string; // class code
+    tt_followed: string; // monday..saturday
+  }): Promise<ApiResponse<{ saturday_class: any; message: string }>> {
+    return apiRequest('/api/admin/saturday-class', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  async updateSaturdayClass(rowId: string, payload: Partial<{ date: string; class: string; tt_followed: string }>): Promise<ApiResponse<{ message: string; saturday_class: any }>> {
+    return apiRequest(`/api/saturday-class/${rowId}`, { method: 'PUT', body: JSON.stringify(payload) });
+  },
+  async deleteSaturdayClass(rowId: string): Promise<ApiResponse<{ message: string }>> {
+    return apiRequest(`/api/saturday-class/${rowId}`, { method: 'DELETE' });
   },
 };
 
@@ -1258,6 +1537,7 @@ export default {
   activity: activityAPI,
   searchUtils: searchUtils,
   calendar: calendarAPI,
+  admin: adminAPI,
 };
 
 // Directory data for signup dropdowns

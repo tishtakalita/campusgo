@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { ChevronLeft, ChevronRight, Plus, Clock, MapPin, Calendar as CalendarIcon, Edit, Trash2, X, ArrowLeft } from 'lucide-react';
-import api, { CalendarEvent } from '../services/api';
+import api, { CalendarEvent, coursesAPI, directoryAPI } from '../services/api';
+import { useUser } from '../contexts/UserContext';
 
 interface CalendarProps {
   onNavigate?: (view: string) => void;
@@ -18,8 +19,11 @@ export function Calendar({ onNavigate }: CalendarProps) {
   const [events, setEvents] = useState<Record<string, CalendarEvent[]>>({});
   const [loading, setLoading] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<CalendarEvent | null>(null);
-  const [showAddEventModal, setShowAddEventModal] = useState(false);
+  const [showCreateEventModal, setShowCreateEventModal] = useState(false);
   const [editingEvent, setEditingEvent] = useState<CalendarEvent | null>(null);
+  const [courses, setCourses] = useState<Array<{ id: string; name?: string; code?: string }>>([]);
+  const [classes, setClasses] = useState<Array<{ id: string; academic_year?: string; section?: string; dept?: string; class?: string }>>([]);
+  const { user } = useUser();
 
   const currentYear = currentDate.getFullYear();
   const currentMonth = currentDate.getMonth() + 1;
@@ -68,6 +72,23 @@ export function Calendar({ onNavigate }: CalendarProps) {
     fetchEvents(currentYear, currentMonth);
   }, [currentYear, currentMonth]);
 
+  useEffect(() => {
+    // Preload courses for faculty event creation
+    (async () => {
+      try {
+        const res = await coursesAPI.getAllCourses();
+        if (!res.error && res.data?.courses) setCourses(res.data.courses as any);
+      } catch {}
+    })();
+    // Preload classes for class_id selection (filter by dept when available)
+    (async () => {
+      try {
+        const res = await directoryAPI.listClasses();
+        if (!res.error && res.data?.classes) setClasses(res.data.classes as any);
+      } catch {}
+    })();
+  }, []);
+
   // Helper: format Date as local YYYY-MM-DD (avoid UTC shifts from toISOString)
   const toLocalYMD = (d: Date) => {
     const y = d.getFullYear();
@@ -76,69 +97,39 @@ export function Calendar({ onNavigate }: CalendarProps) {
     return `${y}-${m}-${day}`;
   };
 
-  // Add or update personal event
-  const savePersonalEvent = async (event: Omit<CalendarEvent, 'id'>) => {
-    // Try to persist to backend; fallback to localStorage on failure
+  // Save handler for unified form (create or update)
+  const saveEvent = async (payload: Omit<CalendarEvent, 'id'>) => {
     const userId = getCurrentUserId();
     const toSend: CalendarEvent = {
-      title: event.title,
-      description: event.description,
-      event_type: event.event_type || 'personal',
-      start_date: event.start_date,
-      end_date: event.end_date,
-      start_time: event.start_time,
-      end_time: event.end_time,
-      is_all_day: event.is_all_day,
-      color: event.color,
-      priority: event.priority,
-      location: event.location,
-      is_personal: true,
-      created_by: userId,
+      ...payload,
+      created_by: payload.created_by || userId,
     };
 
     try {
-      // If editing an existing server event (uuid-like), update instead of create
-      if (editingEvent && editingEvent.id && !editingEvent.id.startsWith('personal-')) {
+      if (editingEvent?.id) {
         const updateRes = await api.calendar.updateEvent(editingEvent.id, toSend);
-        if (updateRes.data?.event) {
-          await fetchEvents(currentYear, currentMonth);
-          setShowAddEventModal(false);
-          setEditingEvent(null);
-          return;
-        }
+        if (updateRes.error) throw new Error(updateRes.error);
+      } else {
+        const res = await api.calendar.createEvent(toSend);
+        if (res.error) throw new Error(res.error);
       }
-
-      const res = await api.calendar.createEvent(toSend);
-      if (res.data?.event) {
-        // Refresh month data to include the new event
-        await fetchEvents(currentYear, currentMonth);
-        setShowAddEventModal(false);
-        setEditingEvent(null);
-        return;
-      }
-      // If API returned an error, fall back to local
-      throw new Error(res.error || 'Failed to create event');
+      await fetchEvents(currentYear, currentMonth);
+      setShowCreateEventModal(false);
+      setEditingEvent(null);
     } catch (err) {
-      alert('Failed to create event. Please try again.');
+      alert('Failed to save event. Please try again.');
     }
   };
 
-  // Delete personal event
-  const deletePersonalEvent = async (eventId: string) => {
-    // If this looks like a server event (uuid-like) try API delete first
-    const isLocal = eventId.startsWith('personal-');
-    if (!isLocal) {
-      try {
-        await api.calendar.deleteEvent(eventId);
-        await fetchEvents(currentYear, currentMonth);
-        setSelectedEvent(null);
-        return;
-      } catch (e) {
-        console.warn('Failed to delete server event, falling back to local cleanup', e);
-      }
+  // Delete event (personal or faculty-owned)
+  const deleteEvent = async (eventId: string) => {
+    try {
+      await api.calendar.deleteEvent(eventId);
+      await fetchEvents(currentYear, currentMonth);
+      setSelectedEvent(null);
+    } catch (e) {
+      alert('Failed to delete event');
     }
-    // No local fallback anymore
-    setSelectedEvent(null);
   };
 
   // Navigation functions
@@ -183,27 +174,13 @@ export function Calendar({ onNavigate }: CalendarProps) {
       });
     }
 
-    console.log(`Generated ${days.length} calendar days for ${MONTH_NAMES[currentMonth - 1]} ${currentYear}`);
     return days;
   };
 
   const calendarDays = generateCalendarDays();
 
-  // Get event type color
-  const getEventTypeColor = (eventType: string, color?: string) => {
-    if (color) return color;
-    
-    const colors = {
-      'assignment': '#f59e0b',
-      'exam': '#ef4444',
-      'class': '#3b82f6',
-      'meeting': '#10b981',
-      'deadline': '#f59e0b',
-      'event': '#8b5cf6'
-    };
-    
-    return colors[eventType as keyof typeof colors] || '#6b7280';
-  };
+  // Determine display color for an event
+  const getEventColor = (color?: string) => color || '#6b7280';
 
   return (
     <div className="flex flex-col h-full bg-gray-900 text-white">
@@ -222,13 +199,15 @@ export function Calendar({ onNavigate }: CalendarProps) {
             <h1 className="text-2xl font-bold">Calendar</h1>
           </div>
           
-          <button 
-            className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-            onClick={() => setShowAddEventModal(true)}
-          >
-            <Plus size={16} />
-            Add Personal Event
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+              onClick={() => { setEditingEvent(null); setShowCreateEventModal(true); }}
+            >
+              <Plus size={16} />
+              Create Event
+            </button>
+          </div>
         </div>
 
         {/* Month Navigation */}
@@ -332,13 +311,13 @@ export function Calendar({ onNavigate }: CalendarProps) {
                             <div
                               key={event.id}
                               className="text-xs p-1 rounded cursor-pointer hover:opacity-80 transition-opacity truncate"
-                              style={{ backgroundColor: getEventTypeColor(event.event_type, event.color) + '30' }}
+                              style={{ backgroundColor: getEventColor(event.color) + '30' }}
                               onClick={() => setSelectedEvent(event)}
                               title={event.title}
                             >
                               <div 
                                 className="font-medium truncate" 
-                                style={{ color: getEventTypeColor(event.event_type, event.color) }}
+                                style={{ color: getEventColor(event.color) }}
                               >
                                 {event.title}
                               </div>
@@ -383,15 +362,7 @@ export function Calendar({ onNavigate }: CalendarProps) {
             <div className="flex items-start justify-between mb-4">
               <div>
                 <h3 className="text-xl font-bold text-white">{selectedEvent.title}</h3>
-                <span 
-                  className="inline-block px-2 py-1 rounded text-xs font-medium mt-2"
-                  style={{
-                    backgroundColor: getEventTypeColor(selectedEvent.event_type, selectedEvent.color) + '40',
-                    color: getEventTypeColor(selectedEvent.event_type, selectedEvent.color)
-                  }}
-                >
-                  {selectedEvent.event_type.charAt(0).toUpperCase() + selectedEvent.event_type.slice(1)}
-                </span>
+                {/* Badge can be reintroduced later for categories; for now rely on color */}
               </div>
               <button
                 onClick={() => setSelectedEvent(null)}
@@ -452,13 +423,17 @@ export function Calendar({ onNavigate }: CalendarProps) {
               )}
             </div>
 
-            {/* Personal event actions */}
-            {selectedEvent.is_personal && (
+            {/* Owner actions: allow edit/delete if current user created this event */}
+            {(() => {
+              const uid = getCurrentUserId();
+              const isOwner = uid && selectedEvent.created_by && String(selectedEvent.created_by) === String(uid);
+              return isOwner;
+            })() && (
               <div className="flex gap-2 mt-4 pt-4 border-t border-gray-700">
                 <button
                   onClick={() => {
                     setEditingEvent(selectedEvent);
-                    setShowAddEventModal(true);
+                    setShowCreateEventModal(true);
                     setSelectedEvent(null);
                   }}
                   className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center justify-center gap-2"
@@ -469,11 +444,8 @@ export function Calendar({ onNavigate }: CalendarProps) {
                 <button
                   onClick={() => {
                     if (confirm('Are you sure you want to delete this event?')) {
-                      if (selectedEvent.id) {
-                        deletePersonalEvent(selectedEvent.id);
-                      } else {
-                        setSelectedEvent(null);
-                      }
+                      if (selectedEvent.id) deleteEvent(selectedEvent.id);
+                      else setSelectedEvent(null);
                     }
                   }}
                   className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center justify-center gap-2"
@@ -487,17 +459,15 @@ export function Calendar({ onNavigate }: CalendarProps) {
         </div>
       )}
 
-      {/* Add/Edit Event Modal */}
-      {showAddEventModal && (
+      {/* Create/Edit Event Modal */}
+      {showCreateEventModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-2xl p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between mb-6">
-              <h3 className="text-xl font-bold text-white">
-                {editingEvent ? 'Edit Personal Event' : 'Add Personal Event'}
-              </h3>
+              <h3 className="text-xl font-bold text-white">{editingEvent ? 'Edit Event' : 'Create Event'}</h3>
               <button
                 onClick={() => {
-                  setShowAddEventModal(false);
+                  setShowCreateEventModal(false);
                   setEditingEvent(null);
                 }}
                 className="text-gray-400 hover:text-white text-xl"
@@ -506,13 +476,15 @@ export function Calendar({ onNavigate }: CalendarProps) {
               </button>
             </div>
 
-            <PersonalEventForm
+            <CreateEventForm
               event={editingEvent}
-              onSave={savePersonalEvent}
+              onSave={saveEvent}
               onCancel={() => {
-                setShowAddEventModal(false);
+                setShowCreateEventModal(false);
                 setEditingEvent(null);
               }}
+              courses={courses}
+              classes={classes}
             />
           </div>
         </div>
@@ -521,168 +493,180 @@ export function Calendar({ onNavigate }: CalendarProps) {
   );
 }
 
-// Personal Event Form Component
-interface PersonalEventFormProps {
-  event?: CalendarEvent | null;
-  onSave: (event: Omit<CalendarEvent, 'id'>) => void;
-  onCancel: () => void;
-}
-
-function PersonalEventForm({ event, onSave, onCancel }: PersonalEventFormProps) {
+// Unified Create/Edit Event Form
+function CreateEventForm({ event, onSave, onCancel, courses, classes }: { event?: CalendarEvent | null; onSave: (e: Omit<CalendarEvent,'id'>) => void; onCancel: () => void; courses: Array<{ id: string; name?: string; code?: string }>; classes: Array<{ id: string; academic_year?: string; section?: string; dept?: string; class?: string }> }) {
+  const { user } = useUser();
+  const isStudent = user?.role === 'student';
   const [formData, setFormData] = useState({
+    is_personal: isStudent ? true : (event?.is_personal ?? false),
     title: event?.title || '',
     description: event?.description || '',
-    start_date: event?.start_date || (() => {
-      const d = new Date();
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `${y}-${m}-${day}`;
-    })(),
-    start_time: event?.start_time?.slice(0, 5) || '',
-    end_time: event?.end_time?.slice(0, 5) || '',
-    location: event?.location || '',
+  // no event_type in new schema
+    course_id: event?.course_id || '',
+    assignment_id: event?.assignment_id || '',
+  class: (event as any)?.class || '',
+    start_date: event?.start_date || (() => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
+    is_all_day: event?.is_all_day || false,
+    start_time: event?.start_time?.slice(0,5) || '',
+    end_time: event?.end_time?.slice(0,5) || '',
     priority: event?.priority || 'medium',
+  // status removed from schema
     color: event?.color || '#3b82f6',
-    is_all_day: event?.is_all_day || false
+    location: event?.location || ''
   });
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const [assignments, setAssignments] = useState<Array<{ id: string; title: string }>>([]);
+
+  useEffect(() => {
+    const loadAssignments = async () => {
+      if (!formData.course_id) { setAssignments([]); return; }
+      try {
+        const res = await api.assignments.getAssignmentsByCourse(formData.course_id);
+        if (!res.error && res.data?.assignments) {
+          const simplified = res.data.assignments.map(a => ({ id: a.id, title: a.title }));
+          setAssignments(simplified);
+        } else {
+          setAssignments([]);
+        }
+      } catch {
+        setAssignments([]);
+      }
+    };
+    loadAssignments();
+  }, [formData.course_id]);
+
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    
-    if (!formData.title.trim()) {
-      alert('Please enter a title for the event.');
-      return;
+    if (!formData.title.trim()) { alert('Title is required'); return; }
+    if (!formData.start_date) { alert('Start date is required'); return; }
+    // Class requirements: required only for non-personal events
+    if (!formData.is_personal) {
+      if (!formData.class || formData.class.trim() === '') { alert('Please choose a class.'); return; }
     }
+    if (!formData.is_personal) {
+      // For general events, require a course for logical scoping
+      if (!formData.course_id) { alert('Please choose a course for non-personal events.'); return; }
+    }
+    // end_date removed from schema
 
-    // Only include time fields if provided and not all-day
-    const start_time = formData.is_all_day || !formData.start_time
-      ? undefined
-      : `${formData.start_time}:00`;
-    const end_time = formData.is_all_day || !formData.end_time
-      ? undefined
-      : `${formData.end_time}:00`;
-
+    const norm = (t?: string) => (t && t.length === 5 ? `${t}:00` : t);
     onSave({
+      is_personal: formData.is_personal,
       title: formData.title,
-      description: formData.description,
-      event_type: 'event',
+      description: formData.description || undefined,
+  // no event_type in new schema
       start_date: formData.start_date,
-      start_time,
-      end_time,
+  // end_date removed from schema
       is_all_day: formData.is_all_day,
+      start_time: formData.is_all_day ? undefined : norm(formData.start_time) as any,
+      end_time: formData.is_all_day ? undefined : norm(formData.end_time) as any,
+      priority: formData.priority as any,
+  // status removed from schema
       color: formData.color,
-      priority: formData.priority,
-      location: formData.location,
-      // Align with events table and policy: personal event
-      is_personal: true
+      location: formData.location || undefined,
+      course_id: formData.course_id || undefined,
+      assignment_id: formData.assignment_id || undefined,
+      class: formData.class ? formData.class : undefined,
+      created_by: user?.id
     });
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Event Title *
-        </label>
-        <input
-          type="text"
-          value={formData.title}
-          onChange={(e) => setFormData({ ...formData, title: e.target.value })}
-          className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          placeholder="Enter event title"
-          required
-        />
+    <form onSubmit={submit} className="space-y-4">
+      <div className="flex items-center gap-2">
+        <input type="checkbox" id="is-personal" checked={formData.is_personal} onChange={e => setFormData({ ...formData, is_personal: e.target.checked })} disabled={isStudent} />
+        <label htmlFor="is-personal" className="text-sm text-gray-300">Personal event</label>
+        {isStudent && <span className="text-xs text-gray-400">(Students can create only personal events)</span>}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-2">Title *</label>
+          <input className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.title} onChange={e=>setFormData({...formData, title: e.target.value})} />
+        </div>
+        {/* event_type removed from schema */}
       </div>
 
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Description
-        </label>
-        <textarea
-          value={formData.description}
-          onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-          className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          placeholder="Enter event description (optional)"
-          rows={3}
-        />
+        <label className="block text-sm font-medium text-gray-300 mb-2">Description</label>
+        <textarea className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" rows={3} value={formData.description} onChange={e=>setFormData({...formData, description: e.target.value})} />
       </div>
 
+      {!formData.is_personal && (
+        <>
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">Course *</label>
+            <select className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.course_id} onChange={e=>setFormData({...formData, course_id: e.target.value, assignment_id: ''})}>
+              <option value="">Select a course</option>
+              {courses.map(c => (
+                <option key={c.id} value={c.id}>{(c.code || 'COURSE')} - {(c.name || 'Untitled')}</option>
+              ))}
+            </select>
+          </div>
+
+          {assignments.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Linked Assignment</label>
+              <select className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.assignment_id} onChange={e=>setFormData({...formData, assignment_id: e.target.value})}>
+                <option value="">None</option>
+                {assignments.map(a => (
+                  <option key={a.id} value={a.id}>{a.title}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-gray-300 mb-2">Class *</label>
+            <select className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.class} onChange={e=>setFormData({...formData, class: e.target.value})}>
+              <option value="">Select a class</option>
+              {classes.map(cls => (
+                <option key={cls.id} value={cls.class || ''}>{cls.class || `${cls.dept || ''} ${cls.academic_year || ''} ${cls.section || ''}`}</option>
+              ))}
+            </select>
+          </div>
+        </>
+      )}
+
+      {/* For personal events (any role), class is optional */}
+      {formData.is_personal && (
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-2">Class (optional)</label>
+          <select className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.class} onChange={e=>setFormData({...formData, class: e.target.value})}>
+            <option value="">None</option>
+            {classes.map(cls => (
+              <option key={cls.id} value={cls.class || ''}>{cls.class || `${cls.dept || ''} ${cls.academic_year || ''} ${cls.section || ''}`}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Date *
-        </label>
-        <input
-          type="date"
-          value={formData.start_date}
-          onChange={(e) => setFormData({ ...formData, start_date: e.target.value })}
-          className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          required
-        />
+        <label className="block text-sm font-medium text-gray-300 mb-2">Start Date *</label>
+        <input type="date" className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.start_date} onChange={e=>setFormData({...formData, start_date: e.target.value})} />
       </div>
 
       <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="all-day"
-          checked={formData.is_all_day}
-          onChange={(e) => setFormData({ ...formData, is_all_day: e.target.checked })}
-          className="rounded bg-gray-700 border-gray-600 text-blue-600 focus:ring-blue-500"
-        />
-        <label htmlFor="all-day" className="text-sm text-gray-300">
-          All Day Event
-        </label>
+        <input type="checkbox" id="all-day" checked={formData.is_all_day} onChange={e=>setFormData({...formData, is_all_day: e.target.checked})} />
+        <label htmlFor="all-day" className="text-sm text-gray-300">All Day</label>
       </div>
 
       {!formData.is_all_day && (
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Start Time
-            </label>
-            <input
-              type="time"
-              value={formData.start_time}
-              onChange={(e) => setFormData({ ...formData, start_time: e.target.value })}
-              className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+            <label className="block text-sm font-medium text-gray-300 mb-2">Start Time</label>
+            <input type="time" className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.start_time} onChange={e=>setFormData({...formData, start_time: e.target.value})} />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              End Time
-            </label>
-            <input
-              type="time"
-              value={formData.end_time}
-              onChange={(e) => setFormData({ ...formData, end_time: e.target.value })}
-              className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+            <label className="block text-sm font-medium text-gray-300 mb-2">End Time</label>
+            <input type="time" className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.end_time} onChange={e=>setFormData({...formData, end_time: e.target.value})} />
           </div>
         </div>
       )}
 
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Location
-        </label>
-        <input
-          type="text"
-          value={formData.location}
-          onChange={(e) => setFormData({ ...formData, location: e.target.value })}
-          className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          placeholder="Enter location (optional)"
-        />
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Priority
-        </label>
-        <select
-          value={formData.priority}
-          onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
-          className="w-full bg-gray-700 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-        >
+        <label className="block text-sm font-medium text-gray-300 mb-2">Priority</label>
+        <select className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.priority} onChange={e=>setFormData({...formData, priority: e.target.value})}>
           <option value="low">Low</option>
           <option value="medium">Medium</option>
           <option value="high">High</option>
@@ -690,38 +674,28 @@ function PersonalEventForm({ event, onSave, onCancel }: PersonalEventFormProps) 
       </div>
 
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">
-          Color
-        </label>
+        <label className="block text-sm font-medium text-gray-300 mb-2">Color</label>
         <div className="flex gap-2">
           {['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#84cc16'].map((color) => (
             <button
               key={color}
               type="button"
               onClick={() => setFormData({ ...formData, color })}
-              className={`w-8 h-8 rounded-full border-2 ${
-                formData.color === color ? 'border-white' : 'border-gray-600'
-              }`}
+              className={`w-8 h-8 rounded-full border-2 ${formData.color === color ? 'border-white' : 'border-gray-600'}`}
               style={{ backgroundColor: color }}
             />
           ))}
         </div>
       </div>
 
-      <div className="flex gap-3 pt-4">
-        <button
-          type="submit"
-          className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors"
-        >
-          {event ? 'Update Event' : 'Add Event'}
-        </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="flex-1 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg transition-colors"
-        >
-          Cancel
-        </button>
+      <div>
+        <label className="block text-sm font-medium text-gray-300 mb-2">Location</label>
+        <input className="w-full bg-gray-700 text-white rounded-lg px-3 py-2" value={formData.location} onChange={e=>setFormData({...formData, location: e.target.value})} />
+      </div>
+
+      <div className="flex gap-3 pt-2">
+        <button type="button" onClick={onCancel} className="flex-1 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg">Cancel</button>
+        <button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg">{event ? 'Update Event' : 'Create Event'}</button>
       </div>
     </form>
   );

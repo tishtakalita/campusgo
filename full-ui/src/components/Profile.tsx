@@ -76,7 +76,7 @@ export function Profile({ onBack }: ProfileProps) {
           )}
         </div>
         
-        <div className="space-y-4">
+  <div className="flex flex-nowrap gap-4 w-full overflow-x-auto">
           {[
             { icon: Settings, label: "Settings", desc: "Manage your preferences", action: () => {} },
             { icon: Bell, label: "Notifications", desc: "Customize alerts", action: () => {} },
@@ -88,7 +88,7 @@ export function Profile({ onBack }: ProfileProps) {
               <button 
                 key={index} 
                 onClick={item.action}
-                className={`w-full p-4 rounded-2xl border border-white/10 flex items-center gap-4 transition-colors ${
+                className={`flex-1 basis-0 min-w-[200px] h-full p-4 rounded-2xl border border-white/10 flex items-center gap-4 transition-colors min-h-[88px] ${
                   item.isLogout 
                     ? 'bg-red-600/10 hover:bg-red-600/20' 
                     : 'bg-gray-800 hover:bg-gray-700'
@@ -110,38 +110,84 @@ export function Profile({ onBack }: ProfileProps) {
           })}
         </div>
 
-        {/* User Statistics */}
-        {user?.role === 'faculty' && (
-          <div className="mt-8 p-4 bg-gray-800 rounded-2xl border border-white/10">
-            <h3 className="text-white font-semibold mb-3">Teaching Statistics</h3>
-            <div className="grid grid-cols-2 gap-4 text-center">
-              <div>
-                <p className="text-2xl font-bold text-blue-400">{user?.facultySubjects?.length || 0}</p>
-                <p className="text-sm text-gray-400">Subjects</p>
+        {/* Profile Details from Users table */}
+        <div className="mt-8 p-4 bg-gray-800 rounded-2xl border border-white/10">
+          <h3 className="text-white font-semibold mb-3">Profile Details</h3>
+          <div className="divide-y divide-white/10">
+            {user?.roll_no && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Roll No</span>
+                <span className="text-sm text-white">{user.roll_no}</span>
               </div>
-              <div>
-                <p className="text-2xl font-bold text-green-400">25</p>
-                <p className="text-sm text-gray-400">Students</p>
+            )}
+            {user?.student_id && !user?.roll_no && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Student ID</span>
+                <span className="text-sm text-white">{user.student_id}</span>
               </div>
-            </div>
+            )}
+            {user?.dept && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Department</span>
+                <span className="text-sm text-white">{user.dept}</span>
+              </div>
+            )}
+            {user?.class && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Class</span>
+                <span className="text-sm text-white">{String((user as any).class)}</span>
+              </div>
+            )}
+            {!user?.class && user?.studentClass && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Class</span>
+                <span className="text-sm text-white">{user.studentClass}</span>
+              </div>
+            )}
+            {user?.phone && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Phone</span>
+                <span className="text-sm text-white">{user.phone}</span>
+              </div>
+            )}
+            {(user as any)?.cgpa && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">CGPA</span>
+                <span className="text-sm text-white">{(user as any).cgpa}</span>
+              </div>
+            )}
+            {!((user as any)?.cgpa) && user?.gpa !== undefined && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">GPA</span>
+                <span className="text-sm text-white">{user.gpa}</span>
+              </div>
+            )}
+            {user?.bio && (
+              <div className="py-3">
+                <div className="text-sm text-gray-400 mb-1">Bio</div>
+                <div className="text-sm text-white">{user.bio}</div>
+              </div>
+            )}
+            {user?.last_login && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Last Login</span>
+                <span className="text-sm text-white">{new Date(user.last_login).toLocaleString()}</span>
+              </div>
+            )}
+            {user?.created_at && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Created</span>
+                <span className="text-sm text-white">{new Date(user.created_at).toLocaleDateString()}</span>
+              </div>
+            )}
+            {user?.updated_at && (
+              <div className="flex items-center justify-between py-3">
+                <span className="text-sm text-gray-400">Updated</span>
+                <span className="text-sm text-white">{new Date(user.updated_at).toLocaleDateString()}</span>
+              </div>
+            )}
           </div>
-        )}
-
-        {user?.role === 'student' && (
-          <div className="mt-8 p-4 bg-gray-800 rounded-2xl border border-white/10">
-            <h3 className="text-white font-semibold mb-3">Academic Progress</h3>
-            <div className="grid grid-cols-2 gap-4 text-center">
-              <div>
-                <p className="text-2xl font-bold text-blue-400">6</p>
-                <p className="text-sm text-gray-400">Courses</p>
-              </div>
-              <div>
-                <p className="text-2xl font-bold text-yellow-400">85%</p>
-                <p className="text-sm text-gray-400">Avg. Grade</p>
-              </div>
-            </div>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

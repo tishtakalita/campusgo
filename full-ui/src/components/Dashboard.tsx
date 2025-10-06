@@ -13,7 +13,20 @@ interface DashboardProps {
 export function Dashboard({ onNavigate }: DashboardProps) {
   const { dashboardData, isLoading, error, refreshDashboard } = useDashboard();
   const { user } = useUser();
-  const [upcomingCalendarEvents, setUpcomingCalendarEvents] = useState<Array<{ title: string; subtitle?: string }>>([]);
+  const [upcomingCalendarEvents, setUpcomingCalendarEvents] = useState<Array<{ title: string; subtitle?: string; date: string }>>([]);
+
+  // Helper: format YYYY-MM-DD to 'DD Mon YYYY' (e.g., 05 Oct 2025)
+  const formatEventDate = (dateStr: string) => {
+    try {
+      const d = new Date(`${dateStr}T00:00:00`);
+      const day = String(d.getDate()).padStart(2, '0');
+      const mon = d.toLocaleString('en-US', { month: 'short' });
+      const year = d.getFullYear();
+      return `${day} ${mon} ${year}`;
+    } catch {
+      return dateStr;
+    }
+  };
 
 
   // Auto-refresh dashboard data every 5 minutes
@@ -61,7 +74,7 @@ export function Dashboard({ onNavigate }: DashboardProps) {
           .filter(i => i.date >= todayStr)
           .sort((a, b) => (a.date + (a.start || '')) .localeCompare(b.date + (b.start || '')))
           .slice(0, 2)
-          .map(i => ({ title: i.title, subtitle: i.subtitle }));
+          .map(i => ({ title: i.title, subtitle: i.subtitle, date: i.date }));
         setUpcomingCalendarEvents(filtered);
       } catch (e) {
         console.warn('Failed to load calendar preview', e);
@@ -158,6 +171,9 @@ export function Dashboard({ onNavigate }: DashboardProps) {
           timeRemaining={(currentClass as any).time_remaining || 'Live now'}
           status="ongoing"
           progressPercentage={(currentClass as any).progress_percentage || 0}
+          startTime={currentClass.start_time}
+          endTime={currentClass.end_time}
+          autoProgress={true}
         />
       )}
 
@@ -172,6 +188,9 @@ export function Dashboard({ onNavigate }: DashboardProps) {
             hour12: true 
           })}`}
           status="upcoming"
+          startTime={nextClass.start_time}
+          endTime={nextClass.end_time}
+          autoProgress={true}
         />
       )}
 
@@ -232,6 +251,9 @@ export function Dashboard({ onNavigate }: DashboardProps) {
                   <div className="flex-1">
                     <div className="text-white text-sm font-medium">{evt.title}</div>
                     {evt.subtitle && (<div className="text-gray-400 text-xs">{evt.subtitle}</div>)}
+                  </div>
+                  <div className="text-gray-300 text-xs whitespace-nowrap ml-auto">
+                    {formatEventDate(evt.date)}
                   </div>
                 </div>
               ))

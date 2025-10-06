@@ -21,6 +21,11 @@ export interface User {
   last_login?: string;
   created_at?: string;
   updated_at?: string;
+  // Optional fields from users table or legacy schema used in UI
+  roll_no?: string;
+  dept?: string;
+  class?: string | null; // some backends return class code here
+  cgpa?: number | null;
   // Computed fields for backward compatibility
   name?: string;
   avatar?: string;

@@ -1,34 +1,35 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { ArrowLeft, Bell, CheckCircle } from "lucide-react";
+import { notificationsAPI, type Notification } from "../services/api";
+import { useUser } from "../contexts/UserContext";
 
 interface NotificationsProps {
   onBack: () => void;
 }
 
 export function Notifications({ onBack }: NotificationsProps) {
-  const notifications = [
-    {
-      id: 1,
-      title: "Assignment Due Tomorrow",
-      message: "Neural Network Implementation is due tomorrow",
-      time: "2 hours ago",
-      unread: true
-    },
-    {
-      id: 2,
-      title: "Class Starting Soon",
-      message: "Machine Learning Fundamentals starts in 30 minutes",
-      time: "25 minutes ago",
-      unread: true
-    },
-    {
-      id: 3,
-      title: "Grade Posted",
-      message: "Your Computer Vision assignment has been graded",
-      time: "1 day ago",
-      unread: false
+  const { user } = useUser();
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      if (!user?.id) { setNotifications([]); setLoading(false); return; }
+      setLoading(true);
+      const res = await notificationsAPI.list(user.id);
+      if (!cancelled) {
+        if (!res.error && res.data?.notifications) {
+          setNotifications(res.data.notifications);
+        } else {
+          setNotifications([]);
+        }
+        setLoading(false);
+      }
     }
-  ];
+    load();
+    return () => { cancelled = true; };
+  }, [user?.id]);
 
   return (
     <div className="min-h-screen bg-gray-900">
@@ -43,14 +44,25 @@ export function Notifications({ onBack }: NotificationsProps) {
       </div>
       
       <div className="p-5 space-y-4">
-        {notifications.map((notification) => (
-          <div key={notification.id} className="p-4 bg-gray-800 rounded-2xl border border-white/10">
+        {loading && (
+          <div className="text-gray-400 text-sm">Loading notifications…</div>
+        )}
+        {!loading && notifications.length === 0 && (
+          <div className="text-gray-400 text-sm">No notifications yet.</div>
+        )}
+        {!loading && notifications.map((n) => (
+          <div key={n.id} className="p-4 bg-gray-800 rounded-xl border border-gray-700 hover:bg-gray-750 transition-colors">
             <div className="flex items-start gap-3">
-              <div className={`w-2 h-2 rounded-full mt-2 ${notification.unread ? 'bg-blue-500' : 'bg-gray-600'}`}></div>
-              <div className="flex-1">
-                <h3 className="text-white font-semibold mb-1">{notification.title}</h3>
-                <p className="text-gray-400 text-sm mb-2">{notification.message}</p>
-                <p className="text-gray-500 text-xs">{notification.time}</p>
+              <div className="w-10 h-10 bg-gradient-to-br from-blue-400 to-purple-500 rounded-full flex items-center justify-center text-white flex-shrink-0">
+                <Bell size={16} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-white font-medium truncate">{n.title}</h3>
+                  {!n.is_read && <span className="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0" />}
+                </div>
+                {n.message && <p className="text-gray-300 text-sm mt-1 truncate">{n.message}</p>}
+                <p className="text-gray-500 text-xs mt-1">{new Date(n.created_at || '').toLocaleString()}</p>
               </div>
             </div>
           </div>

@@ -4,11 +4,11 @@ create table public.assignments (
   title character varying(200) not null,
   description text null,
   due_date timestamp without time zone not null,
-  total_points integer null default 100,
-  assignment_type public.assignment_type null default 'homework'::assignment_type,
   created_by uuid null,
   created_at timestamp without time zone null default CURRENT_TIMESTAMP,
+  class character varying null,
   constraint assignments_pkey primary key (id),
+  constraint assignments_class_fkey foreign KEY (class) references class (class) on update CASCADE on delete CASCADE,
   constraint assignments_course_id_fkey foreign KEY (course_id) references courses (id) on update CASCADE on delete CASCADE,
   constraint assignments_created_by_fkey foreign KEY (created_by) references users (id) on update CASCADE on delete CASCADE
 ) TABLESPACE pg_default;

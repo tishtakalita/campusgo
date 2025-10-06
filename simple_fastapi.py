@@ -26,6 +26,12 @@ if not supabase_url or not supabase_key:
 
 # Create Supabase client
 supabase: Client = create_client(supabase_url, supabase_key)
+# Light diagnostic to confirm which key type is used (service_role vs anon)
+try:
+    key_mode = "service_role" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "anon"
+    print(f"[boot] Supabase client created (key={key_mode})")
+except Exception:
+    pass
 
 # Create FastAPI app
 app = FastAPI(
@@ -49,6 +55,329 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------------------------------------------------------
+# Notifications helper
+# ----------------------------------------------------------------------------
+def notify(recipients: list[str] | None, notif_type: str, title: str, message: str | None = None, actor_id: str | None = None, meta: dict | None = None,
+           links: dict | None = None):
+    """Insert notifications for given recipients. Best-effort: swallow errors."""
+    if not recipients:
+        return
+    try:
+        print(f"[notify] attempting insert; recipients={len(recipients)} type={notif_type} title={title[:40]!r}")
+        rows = []
+        for rid in recipients:
+            row = {
+                "recipient_id": rid,
+                "actor_id": actor_id,
+                "notif_type": notif_type,
+                "title": title,
+                "message": message,
+                "meta": meta or {},
+            }
+            # Optional navigation links
+            if links:
+                for k, v in links.items():
+                    row[k] = v
+            rows.append(row)
+        if rows:
+            res = supabase.table("notifications").insert(rows).execute()
+            # Some supabase clients return errors without raising; detect by empty data
+            inserted = 0
+            try:
+                inserted = len(res.data or [])
+            except Exception:
+                inserted = 0
+            if inserted > 0:
+                print(f"[notify] ok; inserted={inserted}")
+            else:
+                print("[notify] primary insert produced no rows; attempting legacy fallback")
+                # Legacy fallback inline (user_id/type columns)
+                legacy_rows = []
+                for rid in (recipients or []):
+                    row = {
+                        "user_id": rid,
+                        "actor_id": actor_id,
+                        "type": notif_type,
+                        "title": title,
+                        "message": message,
+                        "meta": meta or {},
+                    }
+                    if links:
+                        for k, v in links.items():
+                            row[k] = v
+                    legacy_rows.append(row)
+                if legacy_rows:
+                    res2 = supabase.table("notifications").insert(legacy_rows).execute()
+                    try:
+                        inserted2 = len(res2.data or [])
+                    except Exception:
+                        inserted2 = 0
+                    print(f"[notify] legacy insert {'ok' if inserted2>0 else 'no-rows'}; inserted={inserted2}")
+    except Exception as e:
+        # do not break main flow on notification failure, but log for diagnosis
+        try:
+            print("[notify] failed:", repr(e))
+            # Legacy fallback: some DBs may still have user_id/type columns
+            try:
+                legacy_rows = []
+                for rid in (recipients or []):
+                    row = {
+                        "user_id": rid,  # legacy recipient_id
+                        "actor_id": actor_id,
+                        "type": notif_type,  # legacy notif_type
+                        "title": title,
+                        "message": message,
+                        "meta": meta or {},
+                    }
+                    if links:
+                        for k, v in links.items():
+                            row[k] = v
+                    legacy_rows.append(row)
+                if legacy_rows:
+                    res2 = supabase.table("notifications").insert(legacy_rows).execute()
+                    inserted2 = len(res2.data or [])
+                    print(f"[notify] legacy insert ok; inserted={inserted2}")
+            except Exception as e2:
+                print("[notify] legacy fallback failed:", repr(e2))
+        except Exception:
+            pass
+
+# Temporary diagnostic endpoint to validate notifications insert & RLS quickly
+@app.post("/api/notifications/self-test")
+def notifications_self_test(data: dict):
+    try:
+        rid = data.get("recipient_id")
+        if not rid:
+            raise HTTPException(status_code=400, detail="recipient_id is required")
+        test_title = data.get("title") or "Test notification"
+        test_type = data.get("notif_type") or "system"
+        payload = {
+            "recipient_id": rid,
+            "actor_id": data.get("actor_id"),
+            "notif_type": test_type,
+            "title": test_title,
+            "message": data.get("message"),
+            "meta": data.get("meta") or {"source": "self-test"}
+        }
+        # Primary attempt
+        res = None
+        first_err = None
+        try:
+            res = supabase.table("notifications").insert(payload).execute()
+        except Exception as e1:
+            first_err = str(e1)
+        if res and getattr(res, 'data', None):
+            return {"ok": True, "inserted": len(res.data or []), "row": (res.data[0] if res.data else None)}
+        # Legacy fallback (user_id/type)
+        legacy = {
+            "user_id": rid,
+            "actor_id": data.get("actor_id"),
+            "type": test_type,
+            "title": test_title,
+            "message": data.get("message"),
+            "meta": data.get("meta") or {"source": "self-test"}
+        }
+        try:
+            res2 = supabase.table("notifications").insert(legacy).execute()
+            if res2 and getattr(res2, 'data', None):
+                return {"ok": True, "inserted": len(res2.data or []), "row": (res2.data[0] if res2.data else None), "note": "legacy-insert"}
+            return {"ok": False, "error": "Insert returned no rows for both variants", "first_error": first_err}
+        except Exception as e2:
+            return {"ok": False, "error": str(e2), "first_error": first_err}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Return detailed error so caller can see RLS/permission issues
+        return {"ok": False, "error": str(e)}
+
+# Basic notifications endpoints (list, read, read-all, delete, create)
+@app.get("/api/notifications")
+def list_notifications(user_id: str | None = None, unread_only: bool = False):
+    try:
+        # Collect from BOTH new schema (recipient_id) and legacy (user_id) and then merge + sort.
+        collected: list[dict] = []
+
+        # New schema query
+        try:
+            q = supabase.table("notifications").select("*")
+            if user_id:
+                q = q.eq("recipient_id", user_id)
+            if unread_only:
+                try:
+                    q = q.eq("is_read", False)
+                except Exception:
+                    pass
+            try:
+                q = q.order("created_at", desc=True)
+            except Exception:
+                try:
+                    q = q.order("id", desc=True)
+                except Exception:
+                    pass
+            res = q.limit(100).execute()
+            collected.extend(res.data or [])
+        except Exception:
+            pass
+
+        # Legacy schema query (only when filtering by a specific user)
+        if user_id:
+            try:
+                q2 = supabase.table("notifications").select("*")
+                q2 = q2.eq("user_id", user_id)
+                if unread_only:
+                    try:
+                        q2 = q2.eq("is_read", False)
+                    except Exception:
+                        pass
+                try:
+                    q2 = q2.order("created_at", desc=True)
+                except Exception:
+                    try:
+                        q2 = q2.order("id", desc=True)
+                    except Exception:
+                        pass
+                res2 = q2.limit(100).execute()
+                collected.extend(res2.data or [])
+            except Exception:
+                pass
+
+        # Normalize keys and de-duplicate by id
+        norm_map: dict[str, dict] = {}
+        for r in collected:
+            rr = dict(r)
+            if "recipient_id" not in rr and rr.get("user_id"):
+                rr["recipient_id"] = rr.get("user_id")
+            if "notif_type" not in rr and rr.get("type"):
+                rr["notif_type"] = rr.get("type")
+            rid = str(rr.get("id")) if rr.get("id") is not None else None
+            if rid and rid not in norm_map:
+                norm_map[rid] = rr
+            elif not rid:
+                # If row has no id (shouldn't happen), include using a synthetic key
+                norm_map[f"noid-{len(norm_map)}"] = rr
+
+        # Sort by created_at desc when available
+        def sort_key(item: tuple[str, dict]):
+            r = item[1]
+            ts = r.get("created_at")
+            return (ts or ""), str(r.get("id") or "")
+
+        # Limit to 100 after merge
+        merged = [v for _, v in sorted(norm_map.items(), key=sort_key, reverse=True)][:100]
+        return {"notifications": merged}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: str, user_id: str | None = None):
+    try:
+        updated = 0
+        # Try new schema first
+        try:
+            q = supabase.table("notifications").update({"is_read": True}).eq("id", notification_id)
+            if user_id:
+                q = q.eq("recipient_id", user_id)
+            res = q.execute()
+            updated = len(res.data or [])
+        except Exception:
+            updated = 0
+        # If nothing updated and user_id provided, try legacy user_id column
+        if updated == 0 and user_id:
+            try:
+                q2 = supabase.table("notifications").update({"is_read": True}).eq("id", notification_id).eq("user_id", user_id)
+                res2 = q2.execute()
+                updated = len(res2.data or [])
+            except Exception:
+                pass
+        return {"message": "Notification marked as read", "updated": updated}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/notifications/read-all")
+def mark_all_notifications_read(user_id: str):
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        updated = 0
+        # New schema attempt
+        try:
+            res = (
+                supabase
+                .table("notifications")
+                .update({"is_read": True})
+                .eq("recipient_id", user_id)
+                .eq("is_read", False)
+                .execute()
+            )
+            updated = len(res.data or [])
+        except Exception:
+            updated = 0
+        # Legacy fallback if nothing updated
+        if updated == 0:
+            try:
+                q2 = supabase.table("notifications").update({"is_read": True}).eq("user_id", user_id)
+                try:
+                    q2 = q2.eq("is_read", False)
+                except Exception:
+                    pass
+                res2 = q2.execute()
+                updated = len(res2.data or [])
+            except Exception:
+                pass
+        return {"message": "All notifications marked as read", "updated": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/notifications/{notification_id}")
+def delete_notification(notification_id: str, user_id: str | None = None):
+    try:
+        deleted = 0
+        try:
+            q = supabase.table("notifications").delete().eq("id", notification_id)
+            if user_id:
+                q = q.eq("recipient_id", user_id)
+            res = q.execute()
+            deleted = len(res.data or []) if hasattr(res, 'data') else 1
+        except Exception:
+            deleted = 0
+        if deleted == 0 and user_id:
+            try:
+                q2 = supabase.table("notifications").delete().eq("id", notification_id).eq("user_id", user_id)
+                res2 = q2.execute()
+                deleted = len(res2.data or []) if hasattr(res2, 'data') else 1
+            except Exception:
+                pass
+        return {"message": "Notification deleted", "deleted": deleted}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/notifications")
+def create_notification(data: dict):
+    try:
+        required = ["recipient_id", "notif_type", "title"]
+        missing = [k for k in required if not data.get(k)]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing: {', '.join(missing)}")
+        row = {
+            "recipient_id": data["recipient_id"],
+            "actor_id": data.get("actor_id"),
+            "notif_type": data["notif_type"],
+            "title": data["title"],
+            "message": data.get("message"),
+            "meta": data.get("meta") or {},
+        }
+        for key in ["resource_id", "assignment_id", "event_id", "timetable_id", "saturday_row_id"]:
+            if data.get(key) is not None:
+                row[key] = data.get(key)
+        res = supabase.table("notifications").insert(row).execute()
+        return {"message": "Notification created", "notification": res.data[0] if res.data else None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # Health check endpoint
 @app.get("/")
 def root():
@@ -209,20 +538,35 @@ def register(data: dict):
         }
 
         # Optional fields
-        input_class_id = data.get("class") or data.get("class_id")
-        if input_class_id:
-            # Validate class exists; and if possible, ensure dept consistency
+        # Accept either a class row id or a class code string for assignment to users.class (which stores class code)
+        input_class = data.get("class") or data.get("class_id")
+        if input_class:
             try:
-                cls_res = supabase.table("class").select("id, dept").eq("id", input_class_id).limit(1).execute()
-                if not cls_res.data:
-                    raise HTTPException(status_code=400, detail="Invalid class: no such class ID")
-                cls_row = cls_res.data[0]
+                cls_row = None
+                # First try by id
+                try:
+                    cls_res = supabase.table("class").select("id, dept, class").eq("id", input_class).limit(1).execute()
+                    if cls_res.data:
+                        cls_row = cls_res.data[0]
+                except Exception:
+                    cls_row = None
+                # If not found by id, try by class code value
+                if not cls_row:
+                    try:
+                        cls_res2 = supabase.table("class").select("id, dept, class").eq("class", str(input_class)).limit(1).execute()
+                        if cls_res2.data:
+                            cls_row = cls_res2.data[0]
+                    except Exception:
+                        cls_row = None
+                if not cls_row:
+                    raise HTTPException(status_code=400, detail="Invalid class: no such class ID/code")
                 cls_dept = (cls_row.get("dept") or "").strip()
                 if cls_dept and dept_code_match and cls_dept.lower() != str(dept_code_match).lower():
-                    # Enforce that selected class belongs to selected department
                     raise HTTPException(status_code=400, detail="Selected class does not belong to the chosen department")
-                # Tentatively use column name 'class'; we'll fallback to 'class_id' on insert error
-                user_data["class"] = input_class_id
+                # Store the class code string in users.class to match schema and downstream filters
+                cls_code = cls_row.get("class")
+                if cls_code:
+                    user_data["class"] = str(cls_code)
             except HTTPException:
                 raise
             except Exception:
@@ -487,26 +831,108 @@ def get_user_stats():
 # ============================================================================
 
 @app.get("/api/dashboard")
-def get_dashboard():
+def get_dashboard(faculty_id: str | None = None, student_id: str | None = None):
     try:
         # Presence/current_sessions removed: don't query missing table
         # Include course info to align with full assignments/classes views
-        classes = (
+        # Recent classes: scope to student's class or faculty courses when provided
+        q_classes = (
             supabase
             .table("timetable")
             .select("*, courses(name, code)")
             .order("start_time")
-            .limit(5)
-            .execute()
         )
-        assignments = (
-            supabase
-            .table("assignments")
-            .select("*, courses(name, code)")
-            .order("due_date")
-            .limit(5)
-            .execute()
-        )
+        if student_id:
+            # resolve student's class code string; users.class may store id or code
+            class_candidates: list[str] = []
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                if raw_class:
+                    class_candidates.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            class_candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+            except Exception:
+                class_candidates = []
+            class_candidates = list(dict.fromkeys(class_candidates))
+            if class_candidates:
+                if len(class_candidates) == 1:
+                    q_classes = q_classes.eq("class", class_candidates[0])
+                else:
+                    q_classes = q_classes.in_("class", class_candidates)
+            else:
+                q_classes = q_classes.limit(0)
+        elif faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if course_ids:
+                q_classes = q_classes.in_("course_id", course_ids)
+            else:
+                q_classes = q_classes.limit(0)
+        classes = q_classes.limit(5).execute()
+        # Recent assignments, optionally filtered to courses taught by a faculty or student's class
+        if student_id:
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                # Build class candidates: include raw value and resolved class code (if raw is an id)
+                class_candidates = []
+                if raw_class:
+                    class_candidates.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            class_candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+                # Deduplicate
+                class_candidates = list(dict.fromkeys(class_candidates))
+            except Exception:
+                class_candidates = []
+            # If we cannot resolve student's class, do NOT leak all assignments; return none
+            if not class_candidates:
+                assignments = type('obj', (object,), {'data': []})()
+            else:
+                qa = supabase.table("assignments").select("*, courses(name, code)")
+                if len(class_candidates) == 1:
+                    qa = qa.eq("class", class_candidates[0])
+                else:
+                    qa = qa.in_("class", class_candidates)
+                assignments = qa.order("due_date").limit(5).execute()
+        elif faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if course_ids:
+                assignments = (
+                    supabase
+                    .table("assignments")
+                    .select("*, courses(name, code)")
+                    .in_("course_id", course_ids)
+                    .order("due_date")
+                    .limit(5)
+                    .execute()
+                )
+            else:
+                assignments = type('obj', (object,), {'data': []})()
+        else:
+            assignments = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .order("due_date")
+                .limit(5)
+                .execute()
+            )
         return {
             "current_session": None,
             "recent_classes": classes.data,
@@ -516,15 +942,49 @@ def get_dashboard():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/classes/current")
-def get_current_class():
+def get_current_class(faculty_id: str | None = None, student_id: str | None = None):
     try:
         from datetime import datetime, timedelta
         import calendar
         now = datetime.now()
         current_day = now.strftime('%A').lower()  # Get day name: monday, tuesday, etc.
         current_time = now.time()
-        # Get all classes for today (updated for ENUM day_of_week)
-        result = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day).execute()
+        # Get all classes for today (updated for ENUM day_of_week), optionally filtered by faculty's courses
+        course_ids = None
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+        q = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day)
+        if course_ids is not None:
+            if not course_ids:
+                return {"current_class": None}
+            q = q.in_("course_id", course_ids)
+        if student_id:
+            class_candidates: list[str] = []
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                if raw_class:
+                    class_candidates.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            class_candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+            except Exception:
+                class_candidates = []
+            class_candidates = list(dict.fromkeys(class_candidates))
+            if not class_candidates:
+                return {"current_class": None}
+            if len(class_candidates) == 1:
+                q = q.eq("class", class_candidates[0])
+            else:
+                q = q.in_("class", class_candidates)
+        result = q.execute()
         if not result.data:
             return {"current_class": None}
         # Find current class (if any)
@@ -569,7 +1029,7 @@ def get_current_class():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/classes/next")
-def get_next_class():
+def get_next_class(faculty_id: str | None = None, student_id: str | None = None):
     try:
         from datetime import datetime, timedelta
         import calendar
@@ -578,7 +1038,41 @@ def get_next_class():
         current_time = now.time()
         next_class = None
         min_time_diff = None
-        today_result = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day).execute()
+        course_ids = None
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+        q_today = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day)
+        if course_ids is not None:
+            if not course_ids:
+                return {"next_class": None}
+            q_today = q_today.in_("course_id", course_ids)
+        if student_id:
+            class_candidates: list[str] = []
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                if raw_class:
+                    class_candidates.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            class_candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+            except Exception:
+                class_candidates = []
+            class_candidates = list(dict.fromkeys(class_candidates))
+            if not class_candidates:
+                return {"next_class": None}
+            if len(class_candidates) == 1:
+                q_today = q_today.eq("class", class_candidates[0])
+            else:
+                q_today = q_today.in_("class", class_candidates)
+        today_result = q_today.execute()
         if today_result.data:
             for class_item in today_result.data:
                 start_time_str = class_item["start_time"]
@@ -610,7 +1104,34 @@ def get_next_class():
             for day_offset in range(1, 8):
                 check_date = now + timedelta(days=day_offset)
                 check_day = check_date.strftime('%A').lower()
-                day_result = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", check_day).execute()
+                q_day = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", check_day)
+                if course_ids is not None:
+                    if not course_ids:
+                        return {"next_class": None}
+                    q_day = q_day.in_("course_id", course_ids)
+                if student_id:
+                    class_candidates: list[str] = []
+                    try:
+                        ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                        raw_class = (ures.data[0].get("class") if ures.data else None)
+                        if raw_class:
+                            class_candidates.append(str(raw_class))
+                            try:
+                                cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                                if cres.data and cres.data[0].get("class"):
+                                    class_candidates.append(str(cres.data[0].get("class")))
+                            except Exception:
+                                pass
+                    except Exception:
+                        class_candidates = []
+                    class_candidates = list(dict.fromkeys(class_candidates))
+                    if not class_candidates:
+                        return {"next_class": None}
+                    if len(class_candidates) == 1:
+                        q_day = q_day.eq("class", class_candidates[0])
+                    else:
+                        q_day = q_day.in_("class", class_candidates)
+                day_result = q_day.execute()
                 if day_result.data:
                     earliest_class = min(day_result.data, key=lambda x: x["start_time"])
                     start_time_str = earliest_class["start_time"]
@@ -654,9 +1175,42 @@ def get_current_session():
 # ============================================================================
 
 @app.get("/api/classes")
-def get_all_classes():
+def get_all_classes(faculty_id: str | None = None, student_id: str | None = None):
     try:
-        result = supabase.table("timetable").select("*, courses(name, code)").execute()
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if not course_ids:
+                return {"classes": []}
+            result = supabase.table("timetable").select("*, courses(name, code)").in_("course_id", course_ids).execute()
+        else:
+            q = supabase.table("timetable").select("*, courses(name, code)")
+            if student_id:
+                class_candidates: list[str] = []
+                try:
+                    ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                    raw_class = (ures.data[0].get("class") if ures.data else None)
+                    if raw_class:
+                        class_candidates.append(str(raw_class))
+                        try:
+                            cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                            if cres.data and cres.data[0].get("class"):
+                                class_candidates.append(str(cres.data[0].get("class")))
+                        except Exception:
+                            pass
+                except Exception:
+                    class_candidates = []
+                class_candidates = list(dict.fromkeys(class_candidates))
+                if not class_candidates:
+                    return {"classes": []}
+                if len(class_candidates) == 1:
+                    q = q.eq("class", class_candidates[0])
+                else:
+                    q = q.in_("class", class_candidates)
+            result = q.execute()
         return {"classes": result.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -690,12 +1244,50 @@ def create_class(data: dict):
 def update_class(class_id: str, data: dict):
     """Update a class (timetable entry) by id"""
     try:
-        allowed = {"course_id", "room", "section", "start_time", "end_time", "day_of_week"}
+        # Accept both legacy 'section' and current 'class' (class code)
+        allowed = {"course_id", "room", "section", "class", "start_time", "end_time", "day_of_week"}
         update_data = {k: (v.lower() if k == "day_of_week" and isinstance(v, str) else v) for k, v in data.items() if k in allowed}
+        # Map legacy 'section' to 'class' if provided and 'class' not present
+        if "section" in update_data and "class" not in update_data:
+            update_data["class"] = update_data.pop("section")
         if not update_data:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         res = supabase.table("timetable").update(update_data).eq("id", class_id).execute()
-        return {"message": "Class updated", "class": res.data[0] if res.data else None}
+        updated = res.data[0] if res.data else None
+        # Notify students of the class about timetable update
+        try:
+            cls_code = None
+            if updated:
+                cls_code = updated.get("class") or updated.get("section")
+            if not cls_code:
+                # Fallback fetch
+                fetched = supabase.table("timetable").select("class, section").eq("id", class_id).limit(1).execute()
+                if fetched.data:
+                    cls_code = fetched.data[0].get("class") or fetched.data[0].get("section")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(recips, "timetable", f"Timetable updated for {cls_code}", links={"timetable_id": class_id})
+        except Exception:
+            pass
+        # Also notify the faculty teaching this course (if available)
+        try:
+            course_id = None
+            if updated and updated.get("course_id"):
+                course_id = updated.get("course_id")
+            else:
+                fetched = supabase.table("timetable").select("course_id").eq("id", class_id).limit(1).execute()
+                if fetched.data:
+                    course_id = fetched.data[0].get("course_id")
+            if course_id:
+                cres = supabase.table("courses").select("faculty_id").eq("id", course_id).limit(1).execute()
+                faculty_id = (cres.data[0].get("faculty_id") if cres.data else None)
+                if faculty_id:
+                    notify([faculty_id], "timetable", "Your timetable entry was updated", links={"timetable_id": class_id})
+        except Exception:
+            pass
+        return {"message": "Class updated", "class": updated}
     except HTTPException:
         raise
     except Exception as e:
@@ -705,19 +1297,212 @@ def update_class(class_id: str, data: dict):
 def delete_class(class_id: str):
     """Delete a class (timetable entry) by id"""
     try:
+        # Get class code for notifications before deletion
+        try:
+            row = supabase.table("timetable").select("class, section, course_id").eq("id", class_id).limit(1).execute()
+        except Exception:
+            row = type("obj", (), {"data": None})()  # simple empty holder
         supabase.table("timetable").delete().eq("id", class_id).execute()
+        try:
+            cls_code = None
+            if row and row.data:
+                cls_code = row.data[0].get("class") or row.data[0].get("section")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(recips, "timetable", f"Timetable entry removed for {cls_code}", links={"timetable_id": class_id})
+        except Exception:
+            pass
+        # Also notify faculty if course_id is available
+        try:
+            if row and row.data and row.data[0].get("course_id"):
+                course_id = row.data[0].get("course_id")
+                cres = supabase.table("courses").select("faculty_id").eq("id", course_id).limit(1).execute()
+                faculty_id = (cres.data[0].get("faculty_id") if cres.data else None)
+                if faculty_id:
+                    notify([faculty_id], "timetable", "A timetable entry was removed", links={"timetable_id": class_id})
+        except Exception:
+            pass
         return {"message": "Class deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================================
+# ADMIN: Timetable creation endpoints (minimal admin surface)
+# ============================================================================
+
+@app.post("/api/admin/timetable")
+def admin_create_timetable_row(data: dict):
+    """Create a timetable row (admin). SQL requires:
+    - course_id uuid not null
+    - room varchar(100) not null
+    - class text not null (FK to class.class)
+    - start_time time not null (HH:MM[:SS])
+    - end_time time not null
+    - day_of_week enum (monday..saturday)
+    """
+    try:
+        required = ["course_id", "room", "class", "start_time", "end_time", "day_of_week"]
+        missing = [k for k in required if not data.get(k)]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing)}")
+
+        # Validate class value: accept code; if id was sent, resolve to code best-effort
+        cls_val = str(data.get("class")).strip()
+        try:
+            chk = supabase.table("class").select("class").eq("class", cls_val).limit(1).execute()
+            if not chk.data:
+                alt = supabase.table("class").select("class").eq("id", cls_val).limit(1).execute()
+                if alt.data and alt.data[0].get("class"):
+                    cls_val = alt.data[0]["class"]
+        except Exception:
+            pass
+
+        insert_data = {
+            "course_id": data["course_id"],
+            "room": data["room"],
+            "class": cls_val,
+            "start_time": data["start_time"],
+            "end_time": data["end_time"],
+            "day_of_week": str(data["day_of_week"]).lower(),
+        }
+        res = supabase.table("timetable").insert(insert_data).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Failed to create timetable row")
+        created = res.data[0]
+        # Notify students of the class about new timetable entry
+        try:
+            cls_code = created.get("class") or created.get("section")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(recips, "timetable", f"New timetable entry for {cls_code}", links={"timetable_id": created.get("id")})
+        except Exception:
+            pass
+        # Also notify the faculty teaching the course for this timetable row
+        try:
+            if created.get("course_id"):
+                cres = supabase.table("courses").select("faculty_id").eq("id", created.get("course_id")).limit(1).execute()
+                faculty_id = (cres.data[0].get("faculty_id") if cres.data else None)
+                if faculty_id:
+                    notify([faculty_id], "timetable", "New timetable entry created", links={"timetable_id": created.get("id")})
+        except Exception:
+            pass
+        return {"message": "Timetable row created", "timetable": created}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/saturday-class")
+def admin_create_saturday_class(data: dict):
+    """Create a saturday_class mapping (admin). SQL requires:
+    - date date not null (YYYY-MM-DD)
+    - class varchar(50) not null (FK to class.class)
+    - tt_followed enum not null (monday..saturday per saturday_followed_enum)
+    """
+    try:
+        required = ["date", "class", "tt_followed"]
+        missing = [k for k in required if not data.get(k)]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing)}")
+
+        cls_val = str(data.get("class")).strip()
+        try:
+            chk = supabase.table("class").select("class").eq("class", cls_val).limit(1).execute()
+            if not chk.data:
+                alt = supabase.table("class").select("class").eq("id", cls_val).limit(1).execute()
+                if alt.data and alt.data[0].get("class"):
+                    cls_val = alt.data[0]["class"]
+        except Exception:
+            pass
+
+        payload = {
+            "date": data["date"],
+            "class": cls_val,
+            "tt_followed": str(data["tt_followed"]).lower(),
+        }
+        res = supabase.table("saturday_class").insert(payload).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Failed to create saturday_class row")
+        created = res.data[0]
+        # Notify students of the class about Saturday mapping
+        try:
+            cls_code = created.get("class")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    title = f"Saturday follows {created.get('tt_followed','').capitalize()} for {cls_code}"
+                    notify(recips, "saturday_class", title, meta={"date": created.get("date")}, links={"saturday_row_id": created.get("id")})
+        except Exception:
+            pass
+        # Also notify all faculty who teach any course for this class
+        try:
+            cls_code = created.get("class")
+            if cls_code:
+                # Get all course_ids scheduled for this class (any day)
+                tids = supabase.table("timetable").select("course_id").eq("class", cls_code).execute()
+                course_ids = list({r.get("course_id") for r in (tids.data or []) if r.get("course_id")})
+                faculty_ids: list[str] = []
+                if course_ids:
+                    cres = supabase.table("courses").select("faculty_id").in_("id", course_ids).execute()
+                    faculty_ids = list({r.get("faculty_id") for r in (cres.data or []) if r.get("faculty_id")})
+                if faculty_ids:
+                    title = f"Saturday follows {created.get('tt_followed','').capitalize()} for {cls_code}"
+                    notify(faculty_ids, "saturday_class", title, meta={"date": created.get("date")}, links={"saturday_row_id": created.get("id")})
+        except Exception:
+            pass
+        return {"message": "Saturday class mapping created", "saturday_class": created}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/classes/today")
-def get_todays_classes(section: str | None = None):
+def get_todays_classes(section: str | None = None, faculty_id: str | None = None, student_id: str | None = None, class_code: str | None = None):
     try:
         from datetime import datetime
         now = datetime.now()
         current_day = now.strftime('%A').lower()
         current_time = now.time()
         classes: list[dict] = []
+
+        # Resolve allowed course_ids if filtering for a faculty
+        allowed_course_ids: list[str] | None = None
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                allowed_course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                allowed_course_ids = []
+
+        # Resolve student class if provided
+        stu_classes: list[str] = []
+        if student_id and not class_code:
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                if raw_class:
+                    stu_classes.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            stu_classes.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+                stu_classes = list(dict.fromkeys(stu_classes))
+            except Exception:
+                stu_classes = []
+
+        # Determine effective class filter value(s)
+        class_filters: list[str] | None = None
+        if class_code:
+            class_filters = [class_code]
+        elif stu_classes:
+            class_filters = stu_classes
 
         # Handle Saturday differently by reading saturday_class mapping for today's date
         if current_day == "saturday":
@@ -734,9 +1519,9 @@ def get_todays_classes(section: str | None = None):
                 except Exception:
                     sat_mappings = []
 
-            # Optionally filter by section if provided
-            if section:
-                sat_mappings = [r for r in sat_mappings if (r.get("section") or "").lower() == section.lower()]
+            # Optionally filter by class if provided
+            if class_filters:
+                sat_mappings = [r for r in sat_mappings if r.get("class") in class_filters]
 
             if not sat_mappings:
                 return {"classes": []}
@@ -748,23 +1533,42 @@ def get_todays_classes(section: str | None = None):
                     continue
                 # First try with section filter (if provided)
                 base_q = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", followed_day).order("start_time")
-                day_classes = None
-                if mapping.get("section"):
-                    q = base_q.eq("section", mapping["section"])  # class table has section column
-                    day_classes = q.execute()
-                    # Fallback: if none found for that section, try without section filter
-                    if not day_classes.data:
-                        day_classes = base_q.execute()
+                # When a mapping has a class, strictly filter to that class; do NOT fallback to all classes
+                if mapping.get("class"):
+                    q = base_q
+                    # Case-insensitive exact match on class code
+                    try:
+                        q = q.ilike("class", str(mapping["class"]))
+                    except Exception:
+                        q = q.eq("class", mapping["class"])  # fallback to eq if ilike not supported
+                    if allowed_course_ids is not None:
+                        if not allowed_course_ids:
+                            day_classes = type('obj', (object,), {'data': []})()
+                        else:
+                            day_classes = q.in_("course_id", allowed_course_ids).execute()
+                    else:
+                        day_classes = q.execute()
                 else:
-                    day_classes = base_q.execute()
+                    # No class specified in mapping: safest is to return none rather than leaking all
+                    day_classes = type('obj', (object,), {'data': []})()
                 for class_item in (day_classes.data or []):
                     # Annotate for UI clarity
-                    class_item["info"] = f"Saturday • Section {mapping.get('section', '').upper()} • Follows {followed_day.capitalize()}"
+                    class_item["info"] = f"Saturday • Class {mapping.get('class', '')} • Follows {followed_day.capitalize()}"
                     aggregated.append(class_item)
             classes = aggregated
         else:
             # Mon-Fri: query regular class table
-            result = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day).order("start_time").execute()
+            q = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", current_day).order("start_time")
+            if class_filters:
+                if len(class_filters) == 1:
+                    q = q.eq("class", class_filters[0])
+                else:
+                    q = q.in_("class", class_filters)
+            if allowed_course_ids is not None:
+                if not allowed_course_ids:
+                    return {"classes": []}
+                q = q.in_("course_id", allowed_course_ids)
+            result = q.execute()
             classes = result.data or []
 
         # Process class timings and status
@@ -801,22 +1605,94 @@ def get_todays_classes(section: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 # Saturday override mapping CRUD (to maintain which weekday timetable is followed on a Saturday)
+@app.get("/api/saturday-class")
+def list_saturday_class(class_code: str | None = None, student_id: str | None = None):
+    try:
+        q = supabase.table("saturday_class").select("*")
+
+        # If a student_id is provided, restrict results to that student's class only
+        if student_id:
+            try:
+                # Resolve student's class which may be stored as a UUID id or class code string
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                candidates: list[str] = []
+                if raw_class:
+                    candidates.append(str(raw_class))
+                    # Try resolving UUID to class code via class table
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+                # Deduplicate
+                candidates = list(dict.fromkeys(candidates))
+            except Exception:
+                candidates = []
+
+            # If we cannot resolve student's class, do not leak all mappings
+            if not candidates:
+                return {"saturday_class": []}
+
+            if len(candidates) == 1:
+                q = q.eq("class", candidates[0])
+            else:
+                q = q.in_("class", candidates)
+
+        # Optional explicit class filter (further restricts, useful for admin queries)
+        if class_code:
+            q = q.eq("class", class_code)
+
+        res = q.order("date", desc=True).execute()
+        return {"saturday_class": res.data or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/saturday-class")
 def create_saturday_class(data: dict):
     try:
-        required = ["date", "section", "tt_followed"]
+        # Accept either 'class' (preferred) or legacy 'section'
+        required = ["date", "tt_followed"]
         missing = [f for f in required if f not in data or data.get(f) in (None, "")]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing)}")
+        if missing or (not data.get("class") and not data.get("section")):
+            raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing + (["class"] if not data.get('class') and not data.get('section') else []))}")
         to_insert = {
             "date": data["date"],
-            "section": data["section"],
+            "class": data.get("class") or data.get("section"),
             "tt_followed": str(data["tt_followed"]).lower()
         }
         res = supabase.table("saturday_class").insert(to_insert).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Failed to create saturday mapping")
-        return {"message": "Saturday mapping created", "saturday_class": res.data[0]}
+        created = res.data[0]
+        # Notify students of the class about Saturday mapping
+        try:
+            cls_code = created.get("class")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    title = f"Saturday follows {created.get('tt_followed','').capitalize()} for {cls_code}"
+                    notify(recips, "saturday_class", title, meta={"date": created.get("date")}, links={"saturday_row_id": created.get("id")})
+        except Exception:
+            pass
+        # Also notify all faculty who teach any course for this class
+        try:
+            cls_code = created.get("class")
+            if cls_code:
+                tids = supabase.table("timetable").select("course_id").eq("class", cls_code).execute()
+                course_ids = list({r.get("course_id") for r in (tids.data or []) if r.get("course_id")})
+                faculty_ids: list[str] = []
+                if course_ids:
+                    cres = supabase.table("courses").select("faculty_id").in_("id", course_ids).execute()
+                    faculty_ids = list({r.get("faculty_id") for r in (cres.data or []) if r.get("faculty_id")})
+                if faculty_ids:
+                    title = f"Saturday follows {created.get('tt_followed','').capitalize()} for {cls_code}"
+                    notify(faculty_ids, "saturday_class", title, meta={"date": created.get("date")}, links={"saturday_row_id": created.get("id")})
+        except Exception:
+            pass
+        return {"message": "Saturday mapping created", "saturday_class": created}
     except HTTPException:
         raise
     except Exception as e:
@@ -825,12 +1701,51 @@ def create_saturday_class(data: dict):
 @app.put("/api/saturday-class/{row_id}")
 def update_saturday_class(row_id: str, data: dict):
     try:
-        allowed = {"date", "section", "tt_followed"}
+        # Accept 'class' (preferred) and map legacy 'section' if provided
+        allowed = {"date", "class", "section", "tt_followed"}
         update_data = {k: (v.lower() if k == "tt_followed" and isinstance(v, str) else v) for k, v in data.items() if k in allowed}
+        if "section" in update_data and "class" not in update_data:
+            update_data["class"] = update_data.pop("section")
         if not update_data:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         res = supabase.table("saturday_class").update(update_data).eq("id", row_id).execute()
-        return {"message": "Saturday mapping updated", "saturday_class": res.data[0] if res.data else None}
+        updated = res.data[0] if res.data else None
+        try:
+            cls_code = None
+            if updated:
+                cls_code = updated.get("class")
+            if not cls_code:
+                fetched = supabase.table("saturday_class").select("class").eq("id", row_id).limit(1).execute()
+                if fetched.data:
+                    cls_code = fetched.data[0].get("class")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(recips, "saturday_class", f"Saturday mapping updated for {cls_code}", links={"saturday_row_id": row_id})
+        except Exception:
+            pass
+        # Also notify all faculty who teach any course for this class
+        try:
+            cls_code = None
+            if updated:
+                cls_code = updated.get("class")
+            if not cls_code:
+                fetched = supabase.table("saturday_class").select("class").eq("id", row_id).limit(1).execute()
+                if fetched.data:
+                    cls_code = fetched.data[0].get("class")
+            if cls_code:
+                tids = supabase.table("timetable").select("course_id").eq("class", cls_code).execute()
+                course_ids = list({r.get("course_id") for r in (tids.data or []) if r.get("course_id")})
+                faculty_ids: list[str] = []
+                if course_ids:
+                    cres = supabase.table("courses").select("faculty_id").in_("id", course_ids).execute()
+                    faculty_ids = list({r.get("faculty_id") for r in (cres.data or []) if r.get("faculty_id")})
+                if faculty_ids:
+                    notify(faculty_ids, "saturday_class", f"Saturday mapping updated for {cls_code}", links={"saturday_row_id": row_id})
+        except Exception:
+            pass
+        return {"message": "Saturday mapping updated", "saturday_class": updated}
     except HTTPException:
         raise
     except Exception as e:
@@ -839,7 +1754,35 @@ def update_saturday_class(row_id: str, data: dict):
 @app.delete("/api/saturday-class/{row_id}")
 def delete_saturday_class(row_id: str):
     try:
+        # Fetch class for notification before deletion
+        try:
+            row = supabase.table("saturday_class").select("class").eq("id", row_id).limit(1).execute()
+        except Exception:
+            row = type("obj", (), {"data": None})()
         supabase.table("saturday_class").delete().eq("id", row_id).execute()
+        try:
+            if row and row.data and row.data[0].get("class"):
+                cls_code = row.data[0].get("class")
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(recips, "saturday_class", f"Saturday mapping removed for {cls_code}")
+        except Exception:
+            pass
+        # Also notify faculty who teach for this class
+        try:
+            if row and row.data and row.data[0].get("class"):
+                cls_code = row.data[0].get("class")
+                tids = supabase.table("timetable").select("course_id").eq("class", cls_code).execute()
+                course_ids = list({r.get("course_id") for r in (tids.data or []) if r.get("course_id")})
+                faculty_ids: list[str] = []
+                if course_ids:
+                    cres = supabase.table("courses").select("faculty_id").in_("id", course_ids).execute()
+                    faculty_ids = list({r.get("faculty_id") for r in (cres.data or []) if r.get("faculty_id")})
+                if faculty_ids:
+                    notify(faculty_ids, "saturday_class", f"Saturday mapping removed for {cls_code}")
+        except Exception:
+            pass
         return {"message": "Saturday mapping deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -953,7 +1896,7 @@ def get_daily_classes(section: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/classes/by-date")
-def get_classes_by_date(date: str, section: str | None = None):
+def get_classes_by_date(date: str, section: str | None = None, faculty_id: str | None = None, student_id: str | None = None, class_code: str | None = None):
     """Get classes for a specific date (YYYY-MM-DD), with Saturday mapping support.
 
     - If the date is a Saturday, look up saturday_class rows for that date and pull classes from 'class' using tt_followed.
@@ -973,6 +1916,38 @@ def get_classes_by_date(date: str, section: str | None = None):
 
         classes: list[dict] = []
 
+        # Resolve allowed course_ids if filtering for a faculty
+        allowed_course_ids: list[str] | None = None
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                allowed_course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                allowed_course_ids = []
+
+        # Resolve student class if provided
+        stu_classes: list[str] = []
+        if student_id and not class_code:
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                if raw_class:
+                    stu_classes.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            stu_classes.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+                stu_classes = list(dict.fromkeys(stu_classes))
+            except Exception:
+                stu_classes = []
+        class_filters: list[str] | None = None
+        if class_code:
+            class_filters = [class_code]
+        elif stu_classes:
+            class_filters = stu_classes
+
         if weekday_name == "saturday":
             mappings = []
             try:
@@ -985,8 +1960,9 @@ def get_classes_by_date(date: str, section: str | None = None):
                     mappings = sat_rows.data or []
                 except Exception:
                     mappings = []
-            if section:
-                mappings = [r for r in mappings if (r.get("section") or "").lower() == section.lower()]
+            if class_filters:
+                # Only keep mappings whose class matches one of the student's class candidates
+                mappings = [r for r in mappings if r.get("class") in class_filters]
             if not mappings:
                 return {"classes": []}
 
@@ -996,22 +1972,37 @@ def get_classes_by_date(date: str, section: str | None = None):
                 if not followed_day:
                     continue
                 base_q = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", followed_day).order("start_time")
-                day_classes = None
-                if m.get("section"):
-                    q = base_q.eq("section", m["section"]) 
-                    day_classes = q.execute()
-                    if not day_classes.data:
-                        day_classes = base_q.execute()
+                # Strictly filter to the mapped class; do not fallback to unfiltered day
+                if m.get("class"):
+                    q = base_q
+                    try:
+                        q = q.ilike("class", str(m["class"]))
+                    except Exception:
+                        q = q.eq("class", m["class"])  # fallback
+                    if allowed_course_ids is not None:
+                        if not allowed_course_ids:
+                            day_classes = type('obj', (object,), {'data': []})()
+                        else:
+                            day_classes = q.in_("course_id", allowed_course_ids).execute()
+                    else:
+                        day_classes = q.execute()
                 else:
-                    day_classes = base_q.execute()
+                    day_classes = type('obj', (object,), {'data': []})()
                 for c in (day_classes.data or []):
-                    c["info"] = f"{date} • Section {m.get('section','').upper()} • Follows {followed_day.capitalize()}"
+                    c["info"] = f"{date} • Class {m.get('class','')} • Follows {followed_day.capitalize()}"
                     collected.append(c)
             classes = collected
         else:
             q = supabase.table("timetable").select("*, courses(name, code)").eq("day_of_week", weekday_name).order("start_time")
-            if section:
-                q = q.eq("section", section)
+            if class_filters:
+                if len(class_filters) == 1:
+                    q = q.eq("class", class_filters[0])
+                else:
+                    q = q.in_("class", class_filters)
+            if allowed_course_ids is not None:
+                if not allowed_course_ids:
+                    return {"classes": []}
+                q = q.in_("course_id", allowed_course_ids)
             res = q.execute()
             classes = res.data or []
 
@@ -1047,12 +2038,26 @@ def get_classes_by_date(date: str, section: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/classes/date/{date}")
-def get_classes_by_date_path(date: str, section: str | None = None):
+def get_classes_by_date_path(
+    date: str,
+    section: str | None = None,
+    faculty_id: str | None = None,
+    student_id: str | None = None,
+    class_code: str | None = None,
+):
     """Path-param variant to avoid conflicts with class_id routes.
 
-    Example: /api/classes/date/2025-10-04?section=A
+    Forwards all filters (including student_id) to the core handler so student scoping applies.
+
+    Example: /api/classes/date/2025-10-04?section=A&student_id=<uuid>
     """
-    return get_classes_by_date(date=date, section=section)
+    return get_classes_by_date(
+        date=date,
+        section=section,
+        faculty_id=faculty_id,
+        student_id=student_id,
+        class_code=class_code,
+    )
 
 # ============================================================================
 # COURSES & ENROLLMENTS
@@ -1123,11 +2128,128 @@ def get_course_students(course_id: str):
 # ============================================================================
 
 @app.get("/api/resources")
-def get_all_resources():
+def get_all_resources(faculty_id: str | None = None, student_id: str | None = None):
     try:
-        # Fetch raw resources
-        result = supabase.table("resources").select("*").execute()
-        rows = result.data or []
+        # If faculty_id provided, return union of:
+        # - resources uploaded by this faculty
+        # - resources linked to courses taught by this faculty
+        # Additionally, include global resources (no course_id and no class) for all users
+        rows = []
+        if faculty_id and not student_id:
+            try:
+                # Find courses taught by the faculty
+                courses_res = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [c.get("id") for c in (courses_res.data or []) if c.get("id")]
+
+                # Query resources uploaded by faculty
+                uploaded_res = supabase.table("resources").select("*").eq("uploaded_by", faculty_id).execute()
+                by_me = uploaded_res.data or []
+
+                # Query resources for faculty courses (if any)
+                by_courses = []
+                if course_ids:
+                    course_res = supabase.table("resources").select("*").in_("course_id", course_ids).execute()
+                    by_courses = course_res.data or []
+
+                # Global resources: robust fallback — fetch all and filter course_id falsy AND class empty/null
+                try:
+                    all_res = supabase.table("resources").select("*").execute()
+                    def is_global(row):
+                        cid = row.get("course_id")
+                        cls = row.get("class")
+                        def emptyish(v):
+                            if v is None:
+                                return True
+                            s = str(v).strip().lower()
+                            return s == "" or s == "null" or s == "none"
+                        return emptyish(cid) and emptyish(cls)
+                    globals_list = [r for r in (all_res.data or []) if is_global(r)]
+                except Exception:
+                    globals_list = []
+
+                # Merge uniquely by id
+                seen = set()
+                for r in by_me + by_courses + globals_list:
+                    rid = r.get("id")
+                    if rid not in seen:
+                        seen.add(rid)
+                        rows.append(r)
+            except Exception:
+                # Fallback to empty set on failure (do not expose all resources on error)
+                rows = []
+        else:
+            # Student/admin/general use. If student_id provided, scope to student's class.
+            if student_id:
+                try:
+                    # Determine student's class candidates (could be UUID id or class code string)
+                    ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                    raw_class = (ures.data[0].get("class") if ures.data else None)
+                    candidates: list[str] = []
+                    if raw_class:
+                        # include raw value
+                        candidates.append(str(raw_class))
+                        # also try to resolve to class code string via class table when raw is id
+                        try:
+                            cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                            if cres.data and cres.data[0].get("class"):
+                                candidates.append(str(cres.data[0].get("class")))
+                        except Exception:
+                            pass
+                    # de-duplicate while preserving order
+                    candidates = list(dict.fromkeys(candidates))
+                    # Fetch resources for the student's class (if available)
+                    class_rows = []
+                    if candidates:
+                        q = supabase.table("resources").select("*")
+                        if len(candidates) == 1:
+                            q = q.eq("class", candidates[0])
+                        else:
+                            q = q.in_("class", candidates)
+                        result = q.execute()
+                        class_rows = result.data or []
+                    # Always include global resources (no course and no class)
+                    try:
+                        all_res = supabase.table("resources").select("*").execute()
+                        def is_global(row):
+                            cid = row.get("course_id")
+                            cls = row.get("class")
+                            def emptyish(v):
+                                if v is None:
+                                    return True
+                                s = str(v).strip().lower()
+                                return s == "" or s == "null" or s == "none"
+                            return emptyish(cid) and emptyish(cls)
+                        globals_list = [r for r in (all_res.data or []) if is_global(r)]
+                    except Exception:
+                        globals_list = []
+                    # Merge unique
+                    seen = set()
+                    rows = []
+                    for r in class_rows + globals_list:
+                        rid = r.get("id")
+                        if rid not in seen:
+                            seen.add(rid)
+                            rows.append(r)
+                except Exception:
+                    # On failure to resolve, still attempt to return global resources
+                    try:
+                        all_res = supabase.table("resources").select("*").execute()
+                        def is_global(row):
+                            cid = row.get("course_id")
+                            cls = row.get("class")
+                            def emptyish(v):
+                                if v is None:
+                                    return True
+                                s = str(v).strip().lower()
+                                return s == "" or s == "null" or s == "none"
+                            return emptyish(cid) and emptyish(cls)
+                        rows = [r for r in (all_res.data or []) if is_global(r)]
+                    except Exception:
+                        rows = []
+            else:
+                # No scoping input; return all resources
+                result = supabase.table("resources").select("*").execute()
+                rows = result.data or []
 
         # Enrich with uploader names and course info
         try:
@@ -1283,7 +2405,96 @@ def get_file_by_id(file_id: str):
 def get_all_projects():
     try:
         result = supabase.table("projects").select("*, courses(name, code)").execute()
-        return {"projects": result.data}
+        rows = result.data or []
+
+        # Enrich with creator info and members preview/count
+        try:
+            project_ids = [r.get("id") for r in rows if r.get("id")]
+            creator_ids = list({r.get("creator_id") for r in rows if r.get("creator_id")})
+
+            # Build creator map
+            creator_map = {}
+            if creator_ids:
+                ures = (
+                    supabase
+                    .table("users")
+                    .select("id, first_name, last_name, avatar_url")
+                    .in_("id", creator_ids)
+                    .execute()
+                )
+                for u in (ures.data or []):
+                    creator_map[u["id"]] = {
+                        "id": u.get("id"),
+                        "first_name": u.get("first_name"),
+                        "last_name": u.get("last_name"),
+                        "avatar_url": u.get("avatar_url"),
+                        "name": f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+                    }
+
+            # Members: prefer project_members table; fallback to embedded fields in projects row
+            members_by_project: dict[str, list] = {pid: [] for pid in project_ids}
+            if project_ids:
+                try:
+                    pm = (
+                        supabase
+                        .table("project_members")
+                        .select("project_id, user_id, users(first_name, last_name, avatar_url)")
+                        .in_("project_id", project_ids)
+                        .execute()
+                    )
+                    for r in (pm.data or []):
+                        pid = r.get("project_id")
+                        uinfo = r.get("users") or {}
+                        if pid in members_by_project:
+                            members_by_project[pid].append({
+                                "id": r.get("user_id"),
+                                "first_name": uinfo.get("first_name"),
+                                "last_name": uinfo.get("last_name"),
+                                "avatar_url": uinfo.get("avatar_url"),
+                                "name": f"{uinfo.get('first_name','')} {uinfo.get('last_name','')}".strip()
+                            })
+                except Exception:
+                    pass
+
+            # Regardless of join success, fill gaps from embedded arrays if available
+            for pr in rows:
+                pid = pr.get("id")
+                # If no members collected for this project, fallback to embedded arrays
+                if pid and (not members_by_project.get(pid)):
+                    mids = pr.get("member_ids") or []
+                    mnames = pr.get("member_names") or []
+                    out = []
+                    # Support possible comma-separated strings as a fallback
+                    if isinstance(mids, str):
+                        mids = [x.strip() for x in mids.split(",") if x.strip()]
+                    if isinstance(mnames, str):
+                        mnames = [x.strip() for x in mnames.split(",") if x.strip()]
+                    for i, mid in enumerate(mids):
+                        out.append({
+                            "id": mid,
+                            "name": mnames[i] if i < len(mnames) else None
+                        })
+                    members_by_project[pid] = out
+
+            # Attach enrichment per project
+            for pr in rows:
+                cid = pr.get("creator_id")
+                if cid and cid in creator_map:
+                    pr["creator"] = creator_map[cid]
+                    pr["creator_name"] = creator_map[cid].get("name")
+                # current member count and preview (first 5)
+                pid = pr.get("id")
+                pmembers = members_by_project.get(pid) if pid in members_by_project else []
+                # If embedded current_members exists and pmembers is empty, keep the embedded value
+                embedded_count = pr.get("current_members")
+                pr["current_members"] = (len(pmembers) if pmembers is not None and len(pmembers) > 0 else (embedded_count or 0))
+                if pmembers:
+                    pr["members_preview"] = pmembers[:5]
+        except Exception:
+            # Enrichment best-effort; proceed with raw rows
+            pass
+
+        return {"projects": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1323,73 +2534,179 @@ def get_project_members(project_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
-# NOTIFICATIONS
-# ============================================================================
-
-@app.get("/api/notifications")
-def get_all_notifications():
-    try:
-        try:
-            result = supabase.table("notifications").select("*").execute()
-            return {"notifications": result.data}
-        except Exception:
-            return {"notifications": []}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/notifications/unread")
-def get_unread_notifications():
-    try:
-        try:
-            result = supabase.table("notifications").select("*").eq("is_read", False).execute()
-            return {"notifications": result.data}
-        except Exception:
-            return {"notifications": []}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# notifications endpoints are defined earlier with filtering support
 
 # ============================================================================
 # ASSIGNMENTS (list/upcoming/overdue/by-id)
 # ============================================================================
 
 @app.get("/api/assignments")
-def get_all_assignments():
+def get_all_assignments(faculty_id: str | None = None, student_id: str | None = None):
     try:
-        result = supabase.table("assignments").select("*, courses(name, code)").order("due_date").execute()
+        # If filtering for students by class
+        if student_id:
+            # Resolve student's class and build candidates (raw + resolved code)
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                raw_class = (ures.data[0].get("class") if ures.data else None)
+                class_candidates = []
+                if raw_class:
+                    class_candidates.append(str(raw_class))
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            class_candidates.append(str(cres.data[0].get("class")))
+                    except Exception:
+                        pass
+                class_candidates = list(dict.fromkeys(class_candidates))
+            except Exception:
+                class_candidates = []
+            # If no class is set for the student, do not return all assignments
+            if not class_candidates:
+                return {"assignments": []}
+            q = supabase.table("assignments").select("*, courses(name, code)")
+            if len(class_candidates) == 1:
+                q = q.eq("class", class_candidates[0])
+            else:
+                q = q.in_("class", class_candidates)
+            result = q.order("due_date").execute()
+            return {"assignments": result.data or []}
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if not course_ids:
+                return {"assignments": []}
+            result = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .in_("course_id", course_ids)
+                .order("due_date")
+                .execute()
+            )
+        else:
+            result = supabase.table("assignments").select("*, courses(name, code)").order("due_date").execute()
         return {"assignments": result.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/assignments/upcoming")
-def get_upcoming_assignments():
+def get_upcoming_assignments(faculty_id: str | None = None, student_id: str | None = None):
     try:
         from datetime import datetime
         today_iso = datetime.now().date().isoformat()
-        result = (
-            supabase
-            .table("assignments")
-            .select("*, courses(name, code)")
-            .gte("due_date", today_iso)
-            .order("due_date")
-            .execute()
-        )
+        if student_id:
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                stu_class = (ures.data[0].get("class") if ures.data else None)
+                if stu_class:
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", stu_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            stu_class = cres.data[0].get("class")
+                    except Exception:
+                        pass
+            except Exception:
+                stu_class = None
+            if not stu_class:
+                return {"assignments": []}
+            q = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .gte("due_date", today_iso)
+                .eq("class", stu_class)
+            )
+            result = q.order("due_date").execute()
+            return {"assignments": result.data or []}
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if not course_ids:
+                return {"assignments": []}
+            result = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .in_("course_id", course_ids)
+                .gte("due_date", today_iso)
+                .order("due_date")
+                .execute()
+            )
+        else:
+            result = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .gte("due_date", today_iso)
+                .order("due_date")
+                .execute()
+            )
         return {"assignments": result.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/assignments/overdue")
-def get_overdue_assignments():
+def get_overdue_assignments(faculty_id: str | None = None, student_id: str | None = None):
     try:
         from datetime import datetime
         today_iso = datetime.now().date().isoformat()
-        result = (
-            supabase
-            .table("assignments")
-            .select("*, courses(name, code)")
-            .lt("due_date", today_iso)
-            .order("due_date")
-            .execute()
-        )
+        if student_id:
+            try:
+                ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                stu_class = (ures.data[0].get("class") if ures.data else None)
+                if stu_class:
+                    try:
+                        cres = supabase.table("class").select("class").eq("id", stu_class).limit(1).execute()
+                        if cres.data and cres.data[0].get("class"):
+                            stu_class = cres.data[0].get("class")
+                    except Exception:
+                        pass
+            except Exception:
+                stu_class = None
+            if not stu_class:
+                return {"assignments": []}
+            q = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .lt("due_date", today_iso)
+                .eq("class", stu_class)
+            )
+            result = q.order("due_date").execute()
+            return {"assignments": result.data or []}
+        if faculty_id:
+            try:
+                cids = supabase.table("courses").select("id").eq("faculty_id", faculty_id).execute()
+                course_ids = [r["id"] for r in (cids.data or [])]
+            except Exception:
+                course_ids = []
+            if not course_ids:
+                return {"assignments": []}
+            result = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .in_("course_id", course_ids)
+                .lt("due_date", today_iso)
+                .order("due_date")
+                .execute()
+            )
+        else:
+            result = (
+                supabase
+                .table("assignments")
+                .select("*, courses(name, code)")
+                .lt("due_date", today_iso)
+                .order("due_date")
+                .execute()
+            )
         return {"assignments": result.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1411,14 +2728,11 @@ def create_assignment(data: dict):
         if missing:
             raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing)}")
 
+        # Only include columns that are guaranteed to exist in minimal schema
         insert_data = {
             "title": data["title"],
             "description": data.get("description"),
             "due_date": data["due_date"],
-            "total_points": data.get("total_points", 100),
-            "assignment_type": data.get("assignment_type", "homework"),
-            "priority": data.get("priority", "medium"),
-            "is_published": data.get("is_published", True),
             "created_by": data.get("created_by")
         }
 
@@ -1433,10 +2747,51 @@ def create_assignment(data: dict):
             raise HTTPException(status_code=400, detail="course_id or class_id is required")
         insert_data["course_id"] = course_id
 
+        # Optional: include class (string FK to class.class)
+        if data.get("class"):
+            try:
+                # Validate exists in class table's 'class' column if possible
+                cls_chk = supabase.table("class").select("class").eq("class", str(data.get("class"))).limit(1).execute()
+                # Even if not found (or error), we can still attempt insert and rely on FK to enforce
+            except Exception:
+                pass
+            insert_data["class"] = str(data.get("class"))
+
         res = supabase.table("assignments").insert(insert_data).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Failed to create assignment")
-        return {"message": "Assignment created", "assignment": res.data[0]}
+        created = res.data[0]
+        # Notify: students enrolled in the class (if class provided), otherwise all students in course timetable
+        try:
+            recipients: list[str] = []
+            # If class code provided, target users with users.class == code
+            cls_code = created.get("class")
+            if cls_code:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+            else:
+                # No class code: best-effort by course - find classes/timetable rows for course and gather student users by those classes
+                try:
+                    tt = supabase.table("timetable").select("class").eq("course_id", course_id).execute()
+                    classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                    if classes:
+                        stu = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                        recipients = [u["id"] for u in (stu.data or []) if u.get("id")]
+                except Exception:
+                    pass
+            if recipients:
+                notify(
+                    recipients=recipients,
+                    notif_type="assignment",
+                    title=f"New assignment: {created.get('title','')}",
+                    message=f"Due on {created.get('due_date','')}",
+                    actor_id=created.get("created_by"),
+                    meta={"course_id": str(course_id)},
+                    links={"assignment_id": created.get("id")},
+                )
+        except Exception:
+            pass
+        return {"message": "Assignment created", "assignment": created}
     except HTTPException:
         raise
     except Exception as e:
@@ -1445,22 +2800,138 @@ def create_assignment(data: dict):
 @app.put("/api/assignments/{assignment_id}")
 def update_assignment(assignment_id: str, data: dict):
     try:
-        allowed = {"title", "description", "due_date", "total_points", "assignment_type", "priority", "is_published", "course_id"}
+        # Optional ownership enforcement
+        acting_user_id = data.get("user_id") or data.get("updated_by")
+        if acting_user_id:
+            # Fetch current assignment
+            existing = supabase.table("assignments").select("created_by").eq("id", assignment_id).limit(1).execute()
+            if not existing.data:
+                raise HTTPException(status_code=404, detail="Assignment not found")
+            created_by = str(existing.data[0].get("created_by")) if existing.data[0].get("created_by") else None
+            # Resolve role
+            try:
+                role_res = supabase.table("users").select("role").eq("id", acting_user_id).limit(1).execute()
+                role = str(role_res.data[0].get("role", "")).lower() if role_res.data else ""
+            except Exception:
+                role = ""
+            # Enforce: faculty can only update their own; students cannot; admins allowed
+            if role == "faculty":
+                if not created_by or created_by != str(acting_user_id):
+                    raise HTTPException(status_code=403, detail="You can only update assignments you created")
+            elif role == "student":
+                raise HTTPException(status_code=403, detail="Students cannot update assignments")
+        # Restrict updates to safe columns present in minimal schema
+        allowed = {"title", "description", "due_date", "course_id", "class"}
         update_data = {k: v for k, v in data.items() if k in allowed}
         if not update_data:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         res = supabase.table("assignments").update(update_data).eq("id", assignment_id).execute()
-        return {"message": "Assignment updated", "assignment": res.data[0] if res.data else None}
+        updated = res.data[0] if res.data else None
+        # Notify impacted students
+        try:
+            if updated:
+                recipients: list[str] = []
+                cls_code = updated.get("class")
+                if cls_code:
+                    ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                    recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                else:
+                    # fallback via course timetable
+                    cid = updated.get("course_id")
+                    tt = supabase.table("timetable").select("class").eq("course_id", cid).execute()
+                    classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                    if classes:
+                        stu = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                        recipients = [u["id"] for u in (stu.data or []) if u.get("id")]
+                if recipients:
+                    notify(
+                        recipients=recipients,
+                        notif_type="assignment",
+                        title=f"Assignment updated: {updated.get('title','')}",
+                        message=f"Due on {updated.get('due_date','')}",
+                        actor_id=data.get("user_id"),
+                        meta={"course_id": str(updated.get("course_id"))},
+                        links={"assignment_id": updated.get("id")},
+                    )
+        except Exception:
+            pass
+        return {"message": "Assignment updated", "assignment": updated}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/assignments/{assignment_id}")
-def delete_assignment(assignment_id: str):
+def delete_assignment(assignment_id: str, user_id: str | None = None):
     try:
+        # Ownership enforcement if user_id provided
+        if user_id:
+            existing = supabase.table("assignments").select("created_by").eq("id", assignment_id).limit(1).execute()
+            if not existing.data:
+                raise HTTPException(status_code=404, detail="Assignment not found")
+            created_by = str(existing.data[0].get("created_by")) if existing.data[0].get("created_by") else None
+            # Resolve role
+            try:
+                role_res = supabase.table("users").select("role").eq("id", user_id).limit(1).execute()
+                role = str(role_res.data[0].get("role", "")).lower() if role_res.data else ""
+            except Exception:
+                role = ""
+            if role == "faculty":
+                if not created_by or created_by != str(user_id):
+                    raise HTTPException(status_code=403, detail="You can only delete assignments you created")
+            elif role == "student":
+                raise HTTPException(status_code=403, detail="Students cannot delete assignments")
+        # Read before delete to notify correctly
+        row = supabase.table("assignments").select("*").eq("id", assignment_id).limit(1).execute()
         supabase.table("assignments").delete().eq("id", assignment_id).execute()
+        try:
+            if row.data:
+                prev = row.data[0]
+                recipients: list[str] = []
+                cls_code = prev.get("class")
+                if cls_code:
+                    ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                    recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                else:
+                    cid = prev.get("course_id")
+                    tt = supabase.table("timetable").select("class").eq("course_id", cid).execute()
+                    classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                    if classes:
+                        stu = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                        recipients = [u["id"] for u in (stu.data or []) if u.get("id")]
+                if recipients:
+                    notify(
+                        recipients=recipients,
+                        notif_type="assignment",
+                        title=f"Assignment deleted: {prev.get('title','')}",
+                        message=None,
+                        actor_id=user_id,
+                        meta={"course_id": str(prev.get("course_id"))},
+                        links={"assignment_id": prev.get("id")},
+                    )
+        except Exception:
+            pass
         return {"message": "Assignment deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/assignments/my")
+def get_my_assignments(user_id: str):
+    """List assignments created by the provided user_id."""
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        result = (
+            supabase
+            .table("assignments")
+            .select("*, courses(name, code)")
+            .eq("created_by", user_id)
+            .order("due_date")
+            .execute()
+        )
+        return {"assignments": result.data or []}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1807,22 +3278,39 @@ def get_events(month: int = None, year: int = None, user_id: str = None):
             allq = allq.order("start_date", desc=False).execute()
             events = allq.data or []
         else:
-            # Non-personal (or unspecified) events
+            # Determine role and (for students) class code
+            role = None
+            user_class_code = None
+            try:
+                ures = supabase.table("users").select("role, class").eq("id", user_id).limit(1).execute()
+                if ures.data:
+                    role = str(ures.data[0].get("role", "")).lower()
+                    user_class_code = ures.data[0].get("class")
+            except Exception:
+                pass
+
+            # Non-personal events
             try:
                 q1 = supabase.table(base_table).select(base_select)
                 if month and year:
                     q1 = q1.gte("start_date", start_date.isoformat()).lt("start_date", end_date.isoformat())
-                q1 = q1.eq("is_personal", False).execute()
+                q1 = q1.eq("is_personal", False)
+                # If student, restrict by class code
+                if role == "student" and user_class_code:
+                    q1 = q1.eq("class", user_class_code)
+                q1 = q1.execute()
                 if q1.data:
                     for e in q1.data:
                         if e.get('id') not in seen:
                             events.append(e)
                             seen.add(e.get('id'))
             except Exception:
-                # If is_personal column might be missing for older schemas, fall back to base query
+                # If schema lacks is_personal, fall back to base query (still apply class filter for students)
                 q1 = supabase.table(base_table).select(base_select)
                 if month and year:
                     q1 = q1.gte("start_date", start_date.isoformat()).lt("start_date", end_date.isoformat())
+                if role == "student" and user_class_code:
+                    q1 = q1.eq("class", user_class_code)
                 q1 = q1.execute()
                 if q1.data:
                     for e in q1.data:
@@ -1882,29 +3370,24 @@ def create_event(event_data: dict):
         # Required fields
         payload["title"] = str(event_data["title"]).strip()[:255]  # varchar(255) limit
         payload["start_date"] = str(event_data["start_date"])
-        
-        # Fields with DDL defaults
-        payload["event_type"] = str(event_data.get("event_type", "event")).strip()[:50]
+
+        # Fields with DDL defaults (event_type removed from schema)
         payload["priority"] = str(event_data.get("priority", "medium")).strip()[:10]
-        payload["status"] = str(event_data.get("status", "scheduled")).strip()[:20]
+    # status removed from schema; ignore if provided
         payload["color"] = str(event_data.get("color", "#3b82f6")).strip()[:7]
         payload["is_personal"] = bool(event_data.get("is_personal", False))
         payload["is_all_day"] = bool(event_data.get("is_all_day", False))
-        payload["is_recurring"] = bool(event_data.get("is_recurring", False))
         
         # Optional text fields with length limits
         if event_data.get("description"):
             payload["description"] = str(event_data["description"])
         if event_data.get("location"):
             payload["location"] = str(event_data["location"]).strip()[:255]
-        if event_data.get("recurrence_type"):
-            payload["recurrence_type"] = str(event_data["recurrence_type"]).strip()[:20]
+        # recurrence fields removed from schema; ignore if provided
             
         # Optional date fields
-        if event_data.get("end_date"):
-            payload["end_date"] = str(event_data["end_date"])
-        if event_data.get("recurrence_end_date"):
-            payload["recurrence_end_date"] = str(event_data["recurrence_end_date"])
+        # end_date removed from schema; ignore if provided
+        # recurrence_end_date removed from schema; ignore if provided
             
         # Time fields - normalize to HH:MM:SS format
         def normalize_time(time_val):
@@ -1934,15 +3417,9 @@ def create_event(event_data: dict):
             from datetime import datetime as dt
             start_date = dt.strptime(payload["start_date"], "%Y-%m-%d").date()
             
-            if payload.get("end_date"):
-                end_date = dt.strptime(payload["end_date"], "%Y-%m-%d").date()
-                if end_date < start_date:
-                    raise HTTPException(status_code=400, detail="end_date must be >= start_date")
+            # end_date removed from schema; no range validation
                     
-            if payload.get("recurrence_end_date"):
-                rec_end_date = dt.strptime(payload["recurrence_end_date"], "%Y-%m-%d").date()
-                if rec_end_date < start_date:
-                    raise HTTPException(status_code=400, detail="recurrence_end_date must be >= start_date")
+            # recurrence_end_date validation not applicable (field removed)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"Invalid date format: {str(ve)}")
         except HTTPException:
@@ -1956,14 +3433,17 @@ def create_event(event_data: dict):
         else:
             payload["created_by"] = str(event_data["created_by"])
 
-        # Enforce student personal-only rule
+        # Enforce student personal-only rule and capture creator role/class
+        creator_role = None
+        creator_class_code = None
         try:
             creator_id = payload.get("created_by")
             if creator_id:
-                role_res = supabase.table("users").select("role").eq("id", creator_id).limit(1).execute()
+                role_res = supabase.table("users").select("role, class").eq("id", creator_id).limit(1).execute()
                 if role_res.data:
-                    role = str(role_res.data[0].get("role", "")).lower()
-                    if role == "student":
+                    creator_role = str(role_res.data[0].get("role", "")).lower()
+                    creator_class_code = role_res.data[0].get("class")
+                    if creator_role == "student":
                         payload["is_personal"] = True
         except Exception:
             pass
@@ -1985,11 +3465,25 @@ def create_event(event_data: dict):
             except Exception:
                 pass
                 
-        if event_data.get("class_id"):
+        # Class code handling: field is NOT NULL in schema
+        # If not provided and creator is a student, default to their class code
+        incoming_class = event_data.get("class")
+        if not incoming_class and creator_role == "student" and creator_class_code:
+            incoming_class = creator_class_code
+
+        # For non-personal events, class is required
+        if not payload.get("is_personal") and not incoming_class:
+            raise HTTPException(status_code=400, detail="class is required for non-personal events")
+
+        if incoming_class:
             try:
-                class_check = supabase.table("class").select("id").eq("id", event_data["class_id"]).limit(1).execute()
+                class_check = supabase.table("class").select("class").eq("class", incoming_class).limit(1).execute()
                 if class_check.data:
-                    payload["class_id"] = str(event_data["class_id"])
+                    payload["class"] = str(incoming_class)
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid class code")
+            except HTTPException:
+                raise
             except Exception:
                 pass
 
@@ -2001,8 +3495,19 @@ def create_event(event_data: dict):
         result = supabase.table("events").insert(payload).execute()
         if not result.data:
             raise HTTPException(status_code=500, detail="Failed to create event")
-            
-        return {"message": "Event created successfully", "event": result.data[0]}
+        created = result.data[0]
+        # Notify: for non-personal events, notify students in the target class
+        try:
+            if not created.get("is_personal") and created.get("class"):
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", created.get("class")).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    title = f"New event: {created.get('title','')}"
+                    notify(recips, "event", title, actor_id=created.get("created_by"),
+                           meta={"class": created.get("class")}, links={"event_id": created.get("id")})
+        except Exception:
+            pass
+        return {"message": "Event created successfully", "event": created}
         
     except HTTPException:
         raise
@@ -2028,7 +3533,7 @@ def update_event(event_id: str, event_data: dict):
         
         current_event = existing_event.data[0]
         
-        # Enforce student restrictions if acting user is provided
+        # Enforce role-based restrictions if acting user is provided
         acting_user_id = event_data.get("user_id") or event_data.get("updated_by")
         if acting_user_id:
             try:
@@ -2044,6 +3549,13 @@ def update_event(event_id: str, event_data: dict):
                         # Prevent changing created_by
                         if "created_by" in update_payload:
                             update_payload.pop("created_by")
+                    elif role == "faculty":
+                        # Faculty may update only events they created
+                        if str(current_event.get("created_by")) != str(acting_user_id):
+                            raise HTTPException(status_code=403, detail="Faculty can only update events they created")
+                    else:
+                        # admins or unknown roles: no extra restriction
+                        pass
             except HTTPException:
                 raise
             except Exception:
@@ -2055,18 +3567,15 @@ def update_event(event_id: str, event_data: dict):
         # String fields with length limits
         if "title" in update_payload:
             payload["title"] = str(update_payload["title"]).strip()[:255]
-        if "event_type" in update_payload:
-            payload["event_type"] = str(update_payload["event_type"]).strip()[:50]
+        # event_type removed from schema; ignore if provided
         if "priority" in update_payload:
             payload["priority"] = str(update_payload["priority"]).strip()[:10]
-        if "status" in update_payload:
-            payload["status"] = str(update_payload["status"]).strip()[:20]
+        # status removed from schema; ignore if provided
         if "color" in update_payload:
             payload["color"] = str(update_payload["color"]).strip()[:7]
         if "location" in update_payload:
             payload["location"] = str(update_payload["location"]).strip()[:255] if update_payload["location"] else None
-        if "recurrence_type" in update_payload:
-            payload["recurrence_type"] = str(update_payload["recurrence_type"]).strip()[:20] if update_payload["recurrence_type"] else None
+        # recurrence_type removed from schema; ignore if provided
             
         # Text fields
         if "description" in update_payload:
@@ -2077,16 +3586,13 @@ def update_event(event_id: str, event_data: dict):
             payload["is_personal"] = bool(update_payload["is_personal"])
         if "is_all_day" in update_payload:
             payload["is_all_day"] = bool(update_payload["is_all_day"])
-        if "is_recurring" in update_payload:
-            payload["is_recurring"] = bool(update_payload["is_recurring"])
+        # is_recurring removed from schema; ignore if provided
             
         # Date fields
         if "start_date" in update_payload:
             payload["start_date"] = str(update_payload["start_date"])
-        if "end_date" in update_payload:
-            payload["end_date"] = str(update_payload["end_date"]) if update_payload["end_date"] else None
-        if "recurrence_end_date" in update_payload:
-            payload["recurrence_end_date"] = str(update_payload["recurrence_end_date"]) if update_payload["recurrence_end_date"] else None
+        # end_date removed from schema; ignore if provided
+        # recurrence_end_date removed from schema; ignore if provided
             
         # Time fields - normalize to HH:MM:SS
         def normalize_time(time_val):
@@ -2117,23 +3623,17 @@ def update_event(event_id: str, event_data: dict):
         # Date constraint validation per DDL CHECK constraints
         # Get effective dates (new values or existing ones)
         effective_start_date = payload.get("start_date", current_event.get("start_date"))
-        effective_end_date = payload.get("end_date", current_event.get("end_date"))
-        effective_rec_end_date = payload.get("recurrence_end_date", current_event.get("recurrence_end_date"))
+    # end_date removed from schema
+    # recurrence_end_date removed from schema
         
         if effective_start_date:
             try:
                 from datetime import datetime as dt
                 start_date = dt.strptime(str(effective_start_date), "%Y-%m-%d").date()
                 
-                if effective_end_date:
-                    end_date = dt.strptime(str(effective_end_date), "%Y-%m-%d").date()
-                    if end_date < start_date:
-                        raise HTTPException(status_code=400, detail="end_date must be >= start_date")
+                # No end_date validation
                         
-                if effective_rec_end_date:
-                    rec_end_date = dt.strptime(str(effective_rec_end_date), "%Y-%m-%d").date()
-                    if rec_end_date < start_date:
-                        raise HTTPException(status_code=400, detail="recurrence_end_date must be >= start_date")
+                # No recurrence_end_date validation
             except ValueError as ve:
                 raise HTTPException(status_code=400, detail=f"Invalid date format: {str(ve)}")
             except HTTPException:
@@ -2167,17 +3667,27 @@ def update_event(event_id: str, event_data: dict):
                 payload["assignment_id"] = None
                 
         if "class_id" in update_payload:
-            if update_payload["class_id"]:
+            # Ignore legacy class_id field
+            pass
+
+        # Class code update: allow only for non-personal or if remains consistent
+        if "class" in update_payload:
+            new_class = update_payload.get("class")
+            if new_class:
                 try:
-                    class_check = supabase.table("class").select("id").eq("id", update_payload["class_id"]).limit(1).execute()
+                    class_check = supabase.table("class").select("class").eq("class", new_class).limit(1).execute()
                     if class_check.data:
-                        payload["class_id"] = str(update_payload["class_id"])
+                        payload["class"] = str(new_class)
                     else:
-                        payload["class_id"] = None
+                        raise HTTPException(status_code=400, detail="Invalid class code")
+                except HTTPException:
+                    raise
                 except Exception:
-                    payload["class_id"] = None
+                    pass
             else:
-                payload["class_id"] = None
+                # class is NOT NULL in schema; do not allow clearing it on non-personal
+                if not current_event.get("is_personal"):
+                    raise HTTPException(status_code=400, detail="class cannot be cleared for non-personal events")
 
         # Auto-update timestamp per DDL trigger
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -2189,8 +3699,19 @@ def update_event(event_id: str, event_data: dict):
         result = supabase.table("events").update(payload).eq("id", event_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Event not found after update")
-            
-        return {"message": "Event updated successfully", "event": result.data[0]}
+        updated = result.data[0]
+        # Notify: non-personal event updates go to class students
+        try:
+            if not updated.get("is_personal") and updated.get("class"):
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", updated.get("class")).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    title = f"Event updated: {updated.get('title','')}"
+                    notify(recips, "event", title, actor_id=event_data.get("user_id"),
+                           meta={"class": updated.get("class")}, links={"event_id": updated.get("id")})
+        except Exception:
+            pass
+        return {"message": "Event updated successfully", "event": updated}
         
     except HTTPException:
         raise
@@ -2198,13 +3719,76 @@ def update_event(event_id: str, event_data: dict):
         raise HTTPException(status_code=500, detail=f"Error updating event: {str(e)}")
 
 @app.delete("/api/events/{event_id}")
-def delete_event(event_id: str):
+def delete_event(event_id: str, user_id: str | None = None):
     """Delete an event"""
     try:
+        # Always fetch the row first for permission checks and notifications
+        pre = supabase.table("events").select("id, created_by, is_personal, class, title").eq("id", event_id).limit(1).execute()
+        if not pre.data:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        created_by = str(pre.data[0].get("created_by")) if pre.data[0].get("created_by") else None
+        is_personal = bool(pre.data[0].get("is_personal")) if pre.data[0].get("is_personal") is not None else None
+
+        # Ownership enforcement if user_id provided
+        if user_id:
+            # Resolve role
+            try:
+                role_res = supabase.table("users").select("role").eq("id", user_id).limit(1).execute()
+                role = str(role_res.data[0].get("role", "")).lower() if role_res.data else ""
+            except Exception:
+                role = ""
+            if role == "faculty":
+                if not created_by or created_by != str(user_id):
+                    raise HTTPException(status_code=403, detail="You can only delete events you created")
+            elif role == "student":
+                # Students can only delete their own personal events
+                if not created_by or created_by != str(user_id) or not is_personal:
+                    raise HTTPException(status_code=403, detail="Students can only delete their own personal events")
+
+        # Perform deletion
         result = supabase.table("events").delete().eq("id", event_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Event not found")
+
+        # Notify students for non-personal event deletions
+        try:
+            cls = pre.data[0].get("class")
+            if not pre.data[0].get("is_personal") and cls:
+                ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls).execute()
+                recips = [u["id"] for u in (ures.data or []) if u.get("id")]
+                if recips:
+                    notify(
+                        recips,
+                        "event",
+                        f"Event deleted: {pre.data[0].get('title','')}",
+                        actor_id=user_id,
+                        meta={"class": cls},
+                        links={"event_id": pre.data[0].get("id")}
+                    )
+        except Exception:
+            pass
         return {"message": "Event deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/events/my")
+def get_my_events(user_id: str):
+    """List events created by the provided user_id."""
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        result = (
+            supabase
+            .table("events")
+            .select("*, courses(name, code)")
+            .eq("created_by", user_id)
+            .order("start_date")
+            .execute()
+        )
+        return {"events": result.data or []}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2240,17 +3824,47 @@ def get_calendar_month(year: int, month: int, user_id: str | None = None):
             fb = supabase.table(base_table).select(base_select).gte("start_date", first_day.isoformat()).lte("start_date", last_day.isoformat()).order("start_date").execute()
             events = fb.data or []
         else:
+            # Determine role and class code for student
+            role = None
+            user_class_code = None
+            try:
+                ures = supabase.table("users").select("role, class").eq("id", user_id).limit(1).execute()
+                if ures.data:
+                    role = str(ures.data[0].get("role", "")).lower()
+                    user_class_code = ures.data[0].get("class")
+            except Exception:
+                pass
+
             # Non-personal first
             try:
-                q1 = supabase.table(base_table).select(base_select).gte("start_date", first_day.isoformat()).lte("start_date", last_day.isoformat()).eq("is_personal", False).order("start_date").execute()
+                q1 = (
+                    supabase
+                    .table(base_table)
+                    .select(base_select)
+                    .gte("start_date", first_day.isoformat())
+                    .lte("start_date", last_day.isoformat())
+                    .eq("is_personal", False)
+                )
+                if role == "student" and user_class_code:
+                    q1 = q1.eq("class", user_class_code)
+                q1 = q1.order("start_date").execute()
                 if q1.data:
                     for e in q1.data:
                         if e.get('id') not in seen:
                             events.append(e)
                             seen.add(e.get('id'))
             except Exception:
-                # If schema lacks is_personal, just get all
-                q1 = supabase.table(base_table).select(base_select).gte("start_date", first_day.isoformat()).lte("start_date", last_day.isoformat()).order("start_date").execute()
+                # If schema lacks is_personal, just get all (still filter by class for students)
+                q1 = (
+                    supabase
+                    .table(base_table)
+                    .select(base_select)
+                    .gte("start_date", first_day.isoformat())
+                    .lte("start_date", last_day.isoformat())
+                )
+                if role == "student" and user_class_code:
+                    q1 = q1.eq("class", user_class_code)
+                q1 = q1.order("start_date").execute()
                 if q1.data:
                     for e in q1.data:
                         if e.get('id') not in seen:
@@ -2411,12 +4025,48 @@ def send_friend_request(data: dict):
             "message": message,
             "status": "pending"
         }).execute()
-        
+        # Notify receiver about the friend request
+        try:
+            notify([receiver_id], "friend_request", "New friend request", message=message, actor_id=sender_id)
+        except Exception:
+            pass
         return {"message": "Friend request sent successfully", "data": result.data[0]}
     except Exception as e:
-        if "409" in str(e):
+        # Return richer diagnostics so we can see what's failing
+        msg = str(e) or repr(e)
+        if "409" in msg:
             raise e
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=msg)
+
+# -------------------------------------------------------------------------
+# Debug helpers to diagnose environment and friend_requests insert
+# -------------------------------------------------------------------------
+@app.get("/api/debug/key")
+def debug_key_mode():
+    try:
+        mode = "service_role" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "anon"
+        return {"key_mode": mode}
+    except Exception as e:
+        return {"key_mode": "unknown", "error": str(e) or repr(e)}
+
+@app.post("/api/friend-requests/self-test")
+def friend_requests_self_test(data: dict):
+    """Attempt a bare insert into friend_requests and report raw response/errors."""
+    sender_id = data.get("sender_id")
+    receiver_id = data.get("receiver_id")
+    if not sender_id or not receiver_id:
+        raise HTTPException(status_code=400, detail="sender_id and receiver_id are required")
+    try:
+        res = supabase.table("friend_requests").insert({
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "message": data.get("message", "self-test"),
+            "status": "pending"
+        }).execute()
+        return {"ok": True, "data": res.data}
+    except Exception as e:
+        # Surface as much detail as possible
+        return {"ok": False, "error": str(e) or repr(e)}
 
 @app.get("/api/friend-requests/{user_id}")
 def get_friend_requests(user_id: str, type: str = "received"):
@@ -2504,6 +4154,12 @@ def respond_to_friend_request(request_id: str, data: dict):
                 "user2_id": user2_id
             }).execute()
             
+        # Notify sender about the outcome
+        try:
+            outcome = "accepted" if action == "accept" else "rejected"
+            notify([friend_request["sender_id"]], "friend_request", f"Your friend request was {outcome}", actor_id=friend_request["receiver_id"])
+        except Exception:
+            pass
         return {"message": f"Friend request {action}ed successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2580,7 +4236,14 @@ def send_message(data: dict):
             "message_type": message_type,
             "file_url": file_url
         }).execute()
-        
+        # Notify receiver about new message
+        try:
+            preview = (content or "").strip()
+            if len(preview) > 60:
+                preview = preview[:57] + "..."
+            notify([receiver_id], "chat", "New message", message=preview, actor_id=sender_id)
+        except Exception:
+            pass
         return {"message": "Message sent successfully", "data": result.data[0]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -74,9 +74,34 @@ def add_extended_routes(app, supabase):
     # ============================================================================
     
     @app.get("/api/assignments/course/{course_id}")
-    def get_assignments_by_course(course_id: str):
+    def get_assignments_by_course(course_id: str, student_id: str | None = None):
         try:
-            result = supabase.table("assignments").select("*").eq("course_id", course_id).execute()
+            q = supabase.table("assignments").select("*").eq("course_id", course_id)
+            # If a student_id is provided, restrict by that student's class
+            if student_id:
+                try:
+                    ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                    raw_class = (ures.data[0].get("class") if ures.data else None)
+                    candidates = []
+                    if raw_class:
+                        candidates.append(str(raw_class))
+                        try:
+                            cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                            if cres.data and cres.data[0].get("class"):
+                                candidates.append(str(cres.data[0].get("class")))
+                        except Exception:
+                            pass
+                    candidates = list(dict.fromkeys(candidates))
+                    if candidates:
+                        if len(candidates) == 1:
+                            q = q.eq("class", candidates[0])
+                        else:
+                            q = q.in_("class", candidates)
+                    else:
+                        return {"assignments": []}
+                except Exception:
+                    return {"assignments": []}
+            result = q.execute()
             return {"assignments": result.data}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -203,26 +228,131 @@ def add_extended_routes(app, supabase):
     def create_resource(data: dict):
         try:
             # Prepare resource data
+            title = (data.get("title") or "").strip()
+            if not title:
+                raise HTTPException(status_code=400, detail="title is required")
+            # course_id is optional per schema
+            course_id = data.get("course_id") or None
+            uploaded_by = data.get("uploaded_by") or data.get("user_id")
+            if not uploaded_by:
+                raise HTTPException(status_code=400, detail="uploaded_by is required")
+            rtype = (data.get("resource_type") or "document").strip().lower()
+            category = (data.get("category") or "materials").strip().lower()
+            file_url = (data.get("file_url") or "").strip() or None
+            # Some clients may still send external_url; treat it as file_url fallback since DB has only file_url
+            if not file_url:
+                ext_url = (data.get("external_url") or "").strip()
+                if ext_url:
+                    file_url = ext_url
+            if not file_url:
+                raise HTTPException(status_code=400, detail="file_url is required")
+            # Class is optional per schema; accept class code or id and normalize when present
+            cls = (data.get("class") or "").strip()
+            if not cls:
+                cls = None
+            # Validate class best-effort
+            if cls:
+                try:
+                    cchk = supabase.table("class").select("class").eq("class", cls).limit(1).execute()
+                    # If not found, try when caller sent id instead of code
+                    if (not cchk.data):
+                        c2 = supabase.table("class").select("class").eq("id", cls).limit(1).execute()
+                        if c2.data and c2.data[0].get("class"):
+                            cls = c2.data[0]["class"]
+                except Exception:
+                    pass
+
             resource_data = {
-                "title": data.get("title"),
+                "title": title,
                 "description": data.get("description"),
-                "resource_type": data.get("resource_type", "document"),
-                "file_url": data.get("file_url"),  # S3 bucket URL
-                "course_id": data.get("course_id"),
-                "uploaded_by": data.get("uploaded_by"),
+                "resource_type": rtype,
+                "file_url": file_url,
+                "course_id": course_id,
+                "uploaded_by": uploaded_by,
                 "tags": data.get("tags", []),
                 "download_count": 0,
-                "category": data.get("category", "materials"),
+                "category": category,
+                "class": cls,
             }
             
             result = supabase.table("resources").insert(resource_data).execute()
-            return {"message": "Resource created successfully", "resource": result.data[0]}
+            created = result.data[0]
+            # Notify target audience
+            try:
+                recipients: list[str] = []
+                cls_code = created.get("class")
+                course_id = created.get("course_id")
+                if cls_code:
+                    ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                    recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                elif course_id:
+                    # Gather students in classes for this course
+                    tt = supabase.table("timetable").select("class").eq("course_id", course_id).execute()
+                    classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                    if classes:
+                        ures = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                        recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                    else:
+                        recipients = []
+                else:
+                    # Global resource: notify all students and faculty
+                    try:
+                        all_users = supabase.table("users").select("id").in_("role", ["student", "faculty"]).execute()
+                        recipients = [u["id"] for u in (all_users.data or []) if u.get("id")]
+                    except Exception:
+                        recipients = []
+                if recipients:
+                    title = f"New resource: {created.get('title','')}"
+                    from simple_fastapi import notify  # local import to avoid circular during tooling
+                    notify(recipients, "resource", title, actor_id=created.get("uploaded_by"), links={"resource_id": created.get("id")})
+            except Exception:
+                pass
+            return {"message": "Resource created successfully", "resource": created}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.put("/api/resources/{resource_id}")
-    def update_resource(resource_id: str, data: dict):
+    def update_resource(resource_id: str, data: dict, user_id: str | None = None):
         try:
+            # Fetch existing row to determine ownership and global status
+            try:
+                existing_res = supabase.table("resources").select("id, uploaded_by, course_id, class").eq("id", resource_id).limit(1).execute()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail="Failed to load resource")
+            if not existing_res.data:
+                raise HTTPException(status_code=404, detail="Resource not found")
+            existing_row = existing_res.data[0]
+
+            def emptyish(v):
+                if v is None:
+                    return True
+                s = str(v).strip().lower()
+                return s == "" or s == "null" or s == "none"
+
+            is_global = emptyish(existing_row.get("course_id")) and emptyish(existing_row.get("class"))
+
+            # Determine acting user id (from query param or body)
+            uid = user_id or data.get("user_id")
+            if uid:
+                # If global, allow any faculty to update; otherwise enforce owner-only
+                if is_global:
+                    try:
+                        ures = supabase.table("users").select("role").eq("id", uid).limit(1).execute()
+                        role = (ures.data[0].get("role") if ures.data else None)
+                        if not role or str(role).strip().lower() != "faculty":
+                            # Non-faculty must be owner
+                            if str(existing_row.get("uploaded_by")) != str(uid):
+                                raise HTTPException(status_code=403, detail="Only faculty or the uploader can update global resources")
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        # If role check fails unexpectedly, require ownership for safety
+                        if str(existing_row.get("uploaded_by")) != str(uid):
+                            raise HTTPException(status_code=403, detail="You can only update resources you uploaded")
+                else:
+                    # Not global: owner-only
+                    if str(existing_row.get("uploaded_by")) != str(uid):
+                        raise HTTPException(status_code=403, detail="You can only update resources you uploaded")
             # Prepare update data
             update_data = {}
             if "title" in data:
@@ -237,17 +367,152 @@ def add_extended_routes(app, supabase):
                 update_data["tags"] = data["tags"]
             if "category" in data:
                 update_data["category"] = data["category"]
+            # No external_url column in DB; ignore if provided by client
+            # Allow updating class code with validation
+            if "class" in data:
+                cls = (data.get("class") or "").strip()
+                if cls:
+                    try:
+                        cchk = supabase.table("class").select("class").eq("class", cls).limit(1).execute()
+                        if (not cchk.data):
+                            c2 = supabase.table("class").select("class").eq("id", cls).limit(1).execute()
+                            if c2.data and c2.data[0].get("class"):
+                                cls = c2.data[0]["class"]
+                    except Exception:
+                        pass
+                    update_data["class"] = cls
             
             result = supabase.table("resources").update(update_data).eq("id", resource_id).execute()
-            return {"message": f"Resource {resource_id} updated successfully", "resource": result.data[0]}
+            updated = result.data[0]
+            # Notify affected audience
+            try:
+                recipients: list[str] = []
+                cls_code = updated.get("class")
+                course_id = updated.get("course_id")
+                if cls_code:
+                    ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                    recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                elif course_id:
+                    tt = supabase.table("timetable").select("class").eq("course_id", course_id).execute()
+                    classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                    if classes:
+                        ures = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                        recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                else:
+                    try:
+                        all_users = supabase.table("users").select("id").in_("role", ["student", "faculty"]).execute()
+                        recipients = [u["id"] for u in (all_users.data or []) if u.get("id")]
+                    except Exception:
+                        recipients = []
+                if recipients:
+                    title = f"Resource updated: {updated.get('title','')}"
+                    from simple_fastapi import notify
+                    notify(recipients, "resource", title, actor_id=(user_id or updated.get("uploaded_by")), links={"resource_id": updated.get("id")})
+            except Exception:
+                pass
+            return {"message": f"Resource {resource_id} updated successfully", "resource": updated}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.delete("/api/resources/{resource_id}")
-    def delete_resource(resource_id: str):
+    def delete_resource(resource_id: str, user_id: str | None = None):
         try:
+            # Load resource to determine global status and owner
+            existing = supabase.table("resources").select("uploaded_by, course_id, class").eq("id", resource_id).limit(1).execute()
+            if not existing.data:
+                raise HTTPException(status_code=404, detail="Resource not found")
+            row = existing.data[0]
+
+            def emptyish(v):
+                if v is None:
+                    return True
+                s = str(v).strip().lower()
+                return s == "" or s == "null" or s == "none"
+
+            is_global = emptyish(row.get("course_id")) and emptyish(row.get("class"))
+
+            # Enforce permissions when acting user is known
+            if user_id:
+                if is_global:
+                    try:
+                        ures = supabase.table("users").select("role").eq("id", user_id).limit(1).execute()
+                        role = (ures.data[0].get("role") if ures.data else None)
+                        if not role or str(role).strip().lower() != "faculty":
+                            # Non-faculty must be owner
+                            if str(row.get("uploaded_by")) != str(user_id):
+                                raise HTTPException(status_code=403, detail="Only faculty or the uploader can delete global resources")
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        # On error determining role, require ownership
+                        if str(row.get("uploaded_by")) != str(user_id):
+                            raise HTTPException(status_code=403, detail="You can only delete resources you uploaded")
+                else:
+                    if str(row.get("uploaded_by")) != str(user_id):
+                        raise HTTPException(status_code=403, detail="You can only delete resources you uploaded")
+
+            # Fetch resource for notification before delete
+            try:
+                prev = supabase.table("resources").select("id,title,uploaded_by,course_id,class").eq("id", resource_id).limit(1).execute()
+                prev_row = prev.data[0] if prev.data else None
+            except Exception:
+                prev_row = None
             result = supabase.table("resources").delete().eq("id", resource_id).execute()
+            try:
+                if prev_row:
+                    recipients: list[str] = []
+                    cls_code = prev_row.get("class")
+                    course_id = prev_row.get("course_id")
+                    if cls_code:
+                        ures = supabase.table("users").select("id").eq("role", "student").eq("class", cls_code).execute()
+                        recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                    elif course_id:
+                        tt = supabase.table("timetable").select("class").eq("course_id", course_id).execute()
+                        classes = list({r.get("class") for r in (tt.data or []) if r.get("class")})
+                        if classes:
+                            ures = supabase.table("users").select("id").eq("role", "student").in_("class", classes).execute()
+                            recipients = [u["id"] for u in (ures.data or []) if u.get("id")]
+                    else:
+                        try:
+                            all_users = supabase.table("users").select("id").in_("role", ["student", "faculty"]).execute()
+                            recipients = [u["id"] for u in (all_users.data or []) if u.get("id")]
+                        except Exception:
+                            recipients = []
+                    if recipients:
+                        from simple_fastapi import notify
+                        notify(recipients, "resource", f"Resource deleted: {prev_row.get('title','')}", actor_id=user_id, links={"resource_id": resource_id})
+            except Exception:
+                pass
             return {"message": f"Resource {resource_id} deleted successfully"}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/resources/my")
+    def get_my_resources(user_id: str):
+        try:
+            if not user_id:
+                raise HTTPException(status_code=400, detail="user_id is required")
+            result = supabase.table("resources").select("*").eq("uploaded_by", user_id).order("created_at", desc=True).execute()
+            rows = result.data or []
+            # Best-effort enrichment
+            try:
+                course_ids = list({r.get("course_id") for r in rows if r.get("course_id")})
+                course_map = {}
+                if course_ids:
+                    cres = supabase.table("courses").select("id, name, code").in_("id", course_ids).execute()
+                    for c in (cres.data or []):
+                        course_map[c["id"]] = {"name": c.get("name"), "code": c.get("code")}
+                for r in rows:
+                    cid = r.get("course_id")
+                    if cid and cid in course_map:
+                        r["courses"] = course_map[cid]
+            except Exception:
+                pass
+            return {"resources": rows}
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     # ============================================================================
@@ -488,7 +753,8 @@ def add_extended_routes(app, supabase):
     @app.get("/api/project-types")
     def list_project_types():
         """Return available project types.
-        Tries 'project_types' table (value/label), else distinct project_type from 'projects', else defaults.
+        Tries 'project_types' table (value/label) and ensures all allowed defaults are included.
+        We never restrict to only what's present in current data; always expose academic, hackathon, research.
         """
         try:
             allowed = {"academic", "hackathon", "research"}
@@ -497,33 +763,18 @@ def add_extended_routes(app, supabase):
             try:
                 table_res = supabase.table("project_types").select("value, label").execute()
                 if table_res.data:
-                    types = []
+                    label_map = {}
                     for row in table_res.data:
                         v = (row.get("value") or "").strip().lower() or None
                         if v and v in allowed:
-                            types.append({"value": v, "label": row.get("label") or v.capitalize()})
-                    if types:
-                        return {"types": types}
+                            label_map[v] = row.get("label") or v.capitalize()
+                    # Ensure all allowed are present, use defaults for any missing
+                    out = [{"value": v, "label": label_map.get(v, v.capitalize())} for v in defaults]
+                    return {"types": out}
             except Exception:
                 pass
 
-            # Fallback: distinct from projects
-            try:
-                rows = supabase.table("projects").select("project_type").execute()
-                vals = []
-                if rows.data:
-                    seen = set()
-                    for r in rows.data:
-                        v = (r.get("project_type") or "").strip().lower()
-                        if v and v in allowed and v not in seen:
-                            seen.add(v)
-                            vals.append({"value": v, "label": v.capitalize()})
-                if vals:
-                    return {"types": vals}
-            except Exception:
-                pass
-
-            # Default
+            # Default: always return all allowed types
             return {"types": [{"value": v, "label": v.capitalize()} for v in defaults]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -700,24 +951,8 @@ def add_extended_routes(app, supabase):
             raise HTTPException(status_code=500, detail=str(e))
     
     # ============================================================================
-    # ADDITIONAL NOTIFICATION ENDPOINTS
+    # NOTIFICATION SETTINGS (non-conflicting auxiliary endpoints)
     # ============================================================================
-    
-    @app.put("/api/notifications/{notification_id}/read")
-    def mark_notification_read(notification_id: str):
-        return {"message": f"Notification {notification_id} marked as read"}
-    
-    @app.put("/api/notifications/read-all")
-    def mark_all_notifications_read():
-        return {"message": "All notifications marked as read"}
-    
-    @app.delete("/api/notifications/{notification_id}")
-    def delete_notification(notification_id: str):
-        return {"message": f"Notification {notification_id} deleted"}
-    
-    @app.post("/api/notifications")
-    def create_notification(data: dict):
-        return {"message": "Notification created", "data": data}
     
     @app.get("/api/notifications/settings")
     def get_notification_settings():
@@ -804,12 +1039,37 @@ def add_extended_routes(app, supabase):
     # ============================================================================
     
     @app.get("/api/search/assignments")
-    def search_assignments(q: str = ""):
+    def search_assignments(q: str = "", student_id: str | None = None):
         try:
+            qbuilder = supabase.table("assignments").select("*")
+            # For students, scope search to their class
+            if student_id:
+                try:
+                    ures = supabase.table("users").select("class").eq("id", student_id).limit(1).execute()
+                    raw_class = (ures.data[0].get("class") if ures.data else None)
+                    candidates = []
+                    if raw_class:
+                        candidates.append(str(raw_class))
+                        try:
+                            cres = supabase.table("class").select("class").eq("id", raw_class).limit(1).execute()
+                            if cres.data and cres.data[0].get("class"):
+                                candidates.append(str(cres.data[0].get("class")))
+                        except Exception:
+                            pass
+                    candidates = list(dict.fromkeys(candidates))
+                    if not candidates:
+                        return {"assignments": []}
+                    if len(candidates) == 1:
+                        qbuilder = qbuilder.eq("class", candidates[0])
+                    else:
+                        qbuilder = qbuilder.in_("class", candidates)
+                except Exception:
+                    return {"assignments": []}
             if q:
-                result = supabase.table("assignments").select("*").ilike("title", f"%{q}%").execute()
+                qbuilder = qbuilder.ilike("title", f"%{q}%")
             else:
-                result = supabase.table("assignments").select("*").limit(10).execute()
+                qbuilder = qbuilder.limit(10)
+            result = qbuilder.execute()
             return {"assignments": result.data}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))

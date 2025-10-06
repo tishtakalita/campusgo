@@ -28,9 +28,36 @@ export function Projects({ onBack }: ProjectsProps) {
       setLoading(true);
       const response = await projectsAPI.getAllProjects();
       if (!response.error && response.data?.projects) {
-        const projectsData = response.data.projects;
-        setProjects(projectsData);
+        let projectsData = response.data.projects as any[];
         console.log('✅ Loaded projects:', projectsData.length);
+
+        // Hydrate: fetch full member names for each project so we can display all names
+        try {
+          const enriched = await Promise.all(projectsData.map(async (p) => {
+            try {
+              const memRes = await projectsAPI.getProjectMembers(p.id);
+              const members = memRes.data?.members || [];
+              const names = members
+                .map((m: any) => {
+                  const u = m.users || {};
+                  const full = (u.first_name || u.last_name) ? `${u.first_name || ''} ${u.last_name || ''}`.trim() : (u.full_name || '');
+                  return full || null;
+                })
+                .filter(Boolean);
+              // Store all names for display
+              (p as any)._all_member_names = names;
+              // Maintain preview and counts for other UI areas
+              p.members_preview = names.map((n: string) => ({ name: n }));
+              p.current_members = Math.max(p.current_members || 0, names.length);
+            } catch (e) {
+              // ignore hydration failures
+            }
+            return p;
+          }));
+          projectsData = enriched;
+        } catch {}
+
+        setProjects(projectsData);
       }
     } catch (error) {
       console.error('Error loading projects:', error);
@@ -114,7 +141,9 @@ export function Projects({ onBack }: ProjectsProps) {
   };
 
   const getCurrentMemberCount = (project: any) => {
-    return project.current_members || 1;
+    if (Array.isArray(project._all_member_names)) return project._all_member_names.length;
+    if (Array.isArray(project.members_preview)) return project.members_preview.length;
+    return project.current_members || 0;
   };
 
   const getMembersNeeded = (project: any) => {
@@ -295,10 +324,32 @@ export function Projects({ onBack }: ProjectsProps) {
                   </div>
                 </div>
                 
-                <div className="flex justify-end items-center">
-                  <div className="flex items-center gap-2 text-xs text-gray-500">
-                    <span>Created {new Date(project.created_at).toLocaleDateString()}</span>
+                {/* Creator and Members Preview (names) */}
+                <div className="flex justify-between items-center mt-2">
+                  <div className="text-xs text-gray-400">
+                    {project.creator_name ? (
+                      <span>Created by <span className="text-gray-300 font-medium">{project.creator_name}</span></span>
+                    ) : (
+                      <span>Created {new Date(project.created_at).toLocaleDateString()}</span>
+                    )}
                   </div>
+                  {(Array.isArray((project as any)._all_member_names) && (project as any)._all_member_names.length > 0) ? (
+                    <div className="flex items-center gap-2 text-xs text-gray-300">
+                      <span className="text-gray-400">Members:</span>
+                      <span className="truncate max-w-[520px]">
+                        {(project as any)._all_member_names.join(', ')}
+                      </span>
+                    </div>
+                  ) : (
+                    Array.isArray(project.members_preview) && project.members_preview.length > 0 && (
+                      <div className="flex items-center gap-2 text-xs text-gray-300">
+                        <span className="text-gray-400">Members:</span>
+                        <span className="truncate max-w-[520px]">
+                          {project.members_preview.map((m: any) => m.name || 'Member').join(', ')}
+                        </span>
+                      </div>
+                    )
+                  )}
                 </div>
               </div>
             );

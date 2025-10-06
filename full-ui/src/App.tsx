@@ -15,12 +15,13 @@ import { Projects } from "./components/Projects";
 import { Files } from "./components/Files";
 import { AssignmentsList } from "./components/AssignmentsList";
 import { Ideas } from "./components/Ideas";
-import { FacultyDashboard } from "./components/FacultyDashboard";
 import { CreateAssignment } from "./components/CreateAssignment";
 import { UploadResource } from "./components/UploadResource";
 import { ManageClasses } from "./components/ManageClasses";
 import { MonitorProjects } from "./components/MonitorProjects";
 import { Calendar } from "./components/Calendar";
+import AdminDashboard from "./components/AdminDashboard";
+import { Toaster } from "./components/ui/sonner";
 import Chat from "./components/Chat";
 
 type ViewType = 'dashboard' | 'timetable' | 'resources' | 'profile' | 'notifications' | 'search' | 'projects' | 'files' | 'ideas' | 'calendar' | 'chat' | 'assignments' | 'create-assignment' | 'upload-resource' | 'manage-classes' | 'monitor-projects';
@@ -44,6 +45,25 @@ function AppContent() {
   // If no user is logged in, show auth screen
   if (!user) {
     return <Auth onLogin={login} />;
+  }
+
+  // Admin-only: show AdminDashboard and allow navigating to profile/notifications without bottom nav
+  if (user.role === 'admin') {
+    if (currentView === 'profile') {
+      return (
+        <div className="min-h-screen bg-gray-900">
+          <Profile onBack={() => setCurrentView('dashboard')} />
+        </div>
+      );
+    }
+    if (currentView === 'notifications') {
+      return (
+        <div className="min-h-screen bg-gray-900">
+          <Notifications onBack={() => setCurrentView('dashboard')} />
+        </div>
+      );
+    }
+    return <AdminDashboard onBack={() => { /* no-op for admin root */ }} onNavigate={(v: string) => setCurrentView(v as ViewType)} />;
   }
 
   // Faculty-specific views
@@ -131,6 +151,43 @@ function AppContent() {
       );
     }
 
+    // NEW: Faculty - Assignments list
+    if (currentView === 'assignments') {
+      return (
+        <div className="min-h-screen bg-gray-900 pb-20">
+          <AssignmentsList 
+            onBack={() => setCurrentView('dashboard')} 
+            onCreate={() => setCurrentView('create-assignment')} 
+          />
+          <BottomNav 
+            onHomeClick={() => setCurrentView('dashboard')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
+            currentView={currentView}
+          />
+        </div>
+      );
+    }
+
+    // NEW: Faculty - Calendar (Events)
+    if (currentView === 'calendar') {
+      return (
+        <div className="min-h-screen bg-gray-900 pb-20">
+          <Calendar onNavigate={(view: string) => setCurrentView(view as ViewType)} />
+          <BottomNav 
+            onHomeClick={() => setCurrentView('dashboard')}
+            onResourcesClick={() => setCurrentView('resources')}
+            onChatClick={() => setCurrentView('chat')}
+            onProjectsClick={() => setCurrentView('projects')}
+            showProjects={false}
+            currentView={currentView}
+          />
+        </div>
+      );
+    }
+
     if (currentView === 'chat') {
       return (
         <div className="min-h-screen bg-gray-900 pb-20">
@@ -147,7 +204,7 @@ function AppContent() {
       );
     }
 
-    // Faculty Dashboard
+    // Faculty Dashboard should mirror Student Dashboard (Projects tab hidden)
     return (
       <div className="min-h-screen bg-gray-900 pb-20">
         <Header 
@@ -156,11 +213,9 @@ function AppContent() {
           onNotificationsClick={() => setCurrentView('notifications')}
           onProfileClick={() => setCurrentView('profile')}
         />
-        
-        <div className="px-5 mb-6">
-          <FacultyDashboard onNavigate={(view: string) => setCurrentView(view as ViewType)} />
-        </div>
-        
+
+        <Dashboard onNavigate={(view: string) => setCurrentView(view as ViewType)} />
+
         <BottomNav 
           onHomeClick={() => setCurrentView('dashboard')}
           onResourcesClick={() => setCurrentView('resources')}
@@ -284,7 +339,7 @@ function AppContent() {
   if (currentView === 'assignments') {
     return (
       <div className="min-h-screen bg-gray-900 pb-20">
-        <AssignmentsList onBack={() => setCurrentView('dashboard')} />
+        <AssignmentsList onBack={() => setCurrentView('dashboard')} onCreate={() => setCurrentView('create-assignment')} />
         <BottomNav 
           onHomeClick={() => setCurrentView('dashboard')}
           onResourcesClick={() => setCurrentView('resources')}
@@ -370,6 +425,7 @@ export default function App() {
       <DataProvider>
         <DashboardProvider>
           <AppContent />
+          <Toaster position="top-right" richColors />
         </DashboardProvider>
       </DataProvider>
     </UserProvider>

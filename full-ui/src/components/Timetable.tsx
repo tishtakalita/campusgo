@@ -60,7 +60,8 @@ export function Timetable({ onBack }: TimetableProps) {
         const saturday = new Date(monday);
         saturday.setDate(monday.getDate() + 5); // Monday +5 = Saturday
         const saturdayStr = `${saturday.getFullYear()}-${String(saturday.getMonth()+1).padStart(2,'0')}-${String(saturday.getDate()).padStart(2,'0')}`;
-        const satRes = await classesAPI.getClassesByDate(saturdayStr);
+  // If faculty, pass faculty_id through query handled by service
+  const satRes = await classesAPI.getClassesByDate(saturdayStr);
         if (!satRes.error) {
           setSaturdayOverride(satRes.data?.classes || []);
         } else {
@@ -133,16 +134,13 @@ export function Timetable({ onBack }: TimetableProps) {
     });
   })();
   
-  // Filter classes based on user role
-  const userClasses = user?.role === 'faculty' 
-    ? allClasses.filter((cls: any) => user.facultySubjects?.includes(cls.name))
-    : allClasses; // Students see all classes
+  // Trust backend filtering: for faculty, classesAPI already sends faculty_id.
+  const userClasses = allClasses;
 
   // Prepare data for today's view from todayTransformed, and compute current/upcoming status
   const todayClasses = (() => {
-    const base = (user?.role === 'faculty'
-      ? todayTransformed.filter((cls: any) => user.facultySubjects?.includes(cls.name))
-      : todayTransformed);
+    // Trust backend filtering for today as well
+    const base = todayTransformed;
     const now = new Date();
     const currentTime = now.toTimeString().slice(0, 5);
     return base.map((cls: any) => {
